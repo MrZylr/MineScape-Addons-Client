@@ -16,8 +16,9 @@ The launcher signs in with your Minecraft account, prepares a local MineScape in
 1. Download the latest portable launcher `.exe` from the GitHub releases page.
 2. Run the launcher.
 3. Click **Sign in** and complete Microsoft/Minecraft authentication in your browser.
-4. Click **Prepare Client**. The launcher will download Minecraft runtime files, Fabric files, MineScape config data, and the required mods. (This may take a while)
-5. Click **Play** when the launcher says the client is ready.
+4. Click **Prepare Client**. The launcher will download Minecraft runtime files, Fabric files, MineScape config data, and the required mods.
+   (This may take a while)
+6. Click **Play** when the launcher says the client is ready.
 
 Launcher data is stored in:
 
