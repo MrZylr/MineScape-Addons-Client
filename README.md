@@ -1,5 +1,7 @@
 # MineScape Addons Launcher
 
+Disclaimer - There are 3 video files inside the .exe that are missing from the github repository because of file size.
+
 MineScape Addons Launcher is an all-in-one launcher for playing MineScape with the recommended Addons setup.
 
 The launcher signs in with your Minecraft account, prepares a local MineScape instance, downloads the required Minecraft/Fabric runtime files, syncs the required config data, and installs the managed Fabric mods from Modrinth. It also checks for launcher updates and config-data updates so you know when a new version is available or when Prepare Client needs to be run again.
