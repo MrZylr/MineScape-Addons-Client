@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MineScape Addons Launcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="launcher">
+      <header class="topbar">
+        <img src="../assets/logo/icon.png" alt="" class="logo">
+        <div>
+          <h1 id="title">MineScape Addons</h1>
+          <p id="version">Minecraft / Fabric</p>
+        </div>
+        <div class="account">
+          <select id="accounts"></select>
+          <button id="login">Sign in</button>
+          <button id="logout" class="secondary">Sign out</button>
+        </div>
+      </header>
+
+      <section class="hero">
+        <section class="news">
+          <div class="section-title">MineScape Blog</div>
+          <div id="blog" class="blog"></div>
+        </section>
+        <div class="launch-panel">
+          <div class="state-grid">
+            <div>
+              <span>Fabric</span>
+              <strong id="fabric">Pending verification</strong>
+            </div>
+            <div>
+              <span>Status</span>
+              <strong id="ready">Not ready</strong>
+            </div>
+          </div>
+          <progress id="progress" max="100" value="0"></progress>
+          <div class="actions">
+            <button id="prepare">Prepare Client</button>
+            <button id="launch" class="primary">Play</button>
+          </div>
+        </div>
+        <aside class="settings">
+          <div class="section-title">Mod Settings</div>
+          <label class="toggle">
+            <input id="vanilla" type="checkbox">
+            <span>Vanilla launch</span>
+          </label>
+          <div id="mods" class="mods"></div>
+        </aside>
+      </section>
+    </section>
+    <footer id="status">Ready.</footer>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>
