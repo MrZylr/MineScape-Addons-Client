@@ -302,7 +302,8 @@ const bundledMods = [
   ['Prickle', 'https://modrinth.com/mod/prickle', 0],
   ['Xaeros World Map', 'https://modrinth.com/mod/xaeros-world-map', 0],
   ['Auth Me', 'https://modrinth.com/mod/auth-me', 0],
-  ['No Chat Restrictions', 'https://modrinth.com/mod/no-chat-restrictions', 0]
+  ['No Chat Restrictions', 'https://modrinth.com/mod/no-chat-restrictions', 0],
+  ['Minescape Utility', 'https://modrinth.com/mod/minescapeutility', 0]
 ].map(([id, source, versionOffset]) => ({ id, fileName: '', source, required: true, versionOffset }));
 
 function manifest() {
@@ -339,8 +340,6 @@ async function saveSettings(settings, inst = instanceDirectory()) {
 }
 
 async function syncDefaults(inst) {
-  const localDefaults = assetPath('assets', 'defaults');
-  if (fss.existsSync(localDefaults)) await fs.cp(localDefaults, inst, { recursive: true, force: true });
   const versionCheck = await checkDefaultResourceVersion(inst);
   const forceRemoteDownload = versionCheck.prepareRequired;
   status(`GitHub resources version: ${versionCheck.remoteVersion || 'missing'} | Local: ${versionCheck.localVersion || 'missing'} | Redownload: ${forceRemoteDownload}`);
