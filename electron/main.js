@@ -959,7 +959,10 @@ async function launchMinecraft() {
     await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
     if (code !== 0) {
       status(`Minecraft exited with code ${code}. Check ${path.join(inst, 'logs', 'latest-client.log')}.`);
+    } else {
+      status('Minecraft client closed.');
     }
+    send('accounts', await publicState());
   });
   child.unref();
   return `Minecraft launch started. Output is being written to ${path.join(inst, 'logs', 'latest-client.log')}.`;
@@ -1381,7 +1384,7 @@ ipcMain.handle('accounts:select', async (_event, username) => {
 ipcMain.handle('prepare:start', async () => {
   try {
     const result = await prepareClient();
-    status(result.message);
+    status(result.ok ? result.message : `Prepare Client failed: ${result.message}`);
     return result;
   } catch (err) {
     status(`Prepare Client failed: ${err.message}`);

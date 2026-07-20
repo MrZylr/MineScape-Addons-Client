@@ -208,3 +208,8 @@ window.launcher.onAccounts(async value => {
 });
 
 refresh().then(loadBlog).catch(error => setStatus(error.message));
+setInterval(() => {
+  if (!launchInProgress) {
+    refresh().catch(error => setStatus(error.message));
+  }
+}, 5000);
