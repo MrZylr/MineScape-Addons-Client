@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '1',
+  launcherVersion: '3',
   minecraftVersion: '26.1.2',
   fabricLoaderSelection: 'auto-stable',
   offlineDevLaunchEnabled: false,
@@ -1273,7 +1273,7 @@ function buildApplicationMenu() {
         {
           label: 'Update Launcher',
           click: async () => {
-            await shell.openExternal('https://github.com/MrZylr/Minescape-Addons-Launcher');
+            await shell.openExternal('https://github.com/MrZylr/MineScape-Addons-Client');
           }
         }
       ]
