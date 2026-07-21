@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '3',
+  launcherVersion: '5',
   minecraftVersion: '26.1.2',
   fabricLoaderSelection: 'auto-stable',
   offlineDevLaunchEnabled: false,
@@ -132,6 +132,13 @@ async function saveSessions() {
 
 function activeSession() {
   return state.sessions.find(s => s.username?.toLowerCase() === state.activeUsername?.toLowerCase()) || state.sessions[0] || null;
+}
+
+function isSessionExpired(session, skewMinutes = 5) {
+  if (!session?.expiresAt) return false;
+  const expiresAt = Date.parse(session.expiresAt);
+  if (!Number.isFinite(expiresAt)) return true;
+  return expiresAt <= Date.now() + skewMinutes * 60 * 1000;
 }
 
 async function upsertSession(session) {
@@ -300,6 +307,7 @@ const bundledMods = [
   ['MCEF', 'https://modrinth.com/mod/mcef-keksuccino', 0],
   ['Melody', 'https://modrinth.com/mod/melody', 0],
   ['Prickle', 'https://modrinth.com/mod/prickle', 0],
+  ['Xaeros Minimap', 'https://modrinth.com/mod/xaeros-minimap', 0],
   ['Xaeros World Map', 'https://modrinth.com/mod/xaeros-world-map', 0],
   ['Auth Me', 'https://modrinth.com/mod/auth-me', 0],
   ['No Chat Restrictions', 'https://modrinth.com/mod/no-chat-restrictions', 0],
@@ -805,8 +813,9 @@ async function resolveMinecraftSession(ms) {
 
 async function prepareLaunchSession() {
   let session = activeSession();
-  if (session?.minecraftAccessToken) return session;
+  if (session?.minecraftAccessToken && !isSessionExpired(session)) return session;
   if (session?.microsoftRefreshToken) {
+    status('Refreshing Minecraft account session...');
     session = await refreshMicrosoftSession(session);
     session = await resolveMinecraftSession(session);
     await upsertSession(session);
@@ -1159,8 +1168,11 @@ async function resolveBlogImage(url) {
 async function publicState() {
   await readResolvedVersion();
   const ready = await readiness();
-  const canLaunch = ready.ready && (CONFIG.offlineDevLaunchEnabled || state.sessions.length > 0);
-  const canPrepare = CONFIG.offlineDevLaunchEnabled || state.sessions.length > 0;
+  const hasUsableAccount = state.sessions.some(session => session.minecraftAccessToken || session.microsoftRefreshToken);
+  const selectedSession = activeSession();
+  const sessionNeedsRefresh = Boolean(selectedSession?.microsoftRefreshToken && isSessionExpired(selectedSession));
+  const canLaunch = ready.ready && (CONFIG.offlineDevLaunchEnabled || hasUsableAccount);
+  const canPrepare = CONFIG.offlineDevLaunchEnabled || hasUsableAccount;
   const displayReady = !canPrepare
     ? { ready: false, reason: 'Sign in to a Minecraft account' }
     : isFirstRunPrepareReason(ready.reason)
@@ -1177,6 +1189,7 @@ async function publicState() {
     ready: displayReady,
     canLaunch,
     canPrepare,
+    sessionNeedsRefresh,
     settings: await loadSettings(),
     mods: bundledMods
   };

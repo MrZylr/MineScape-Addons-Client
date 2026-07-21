@@ -32,6 +32,9 @@ async function refresh() {
     : current.ready.ready
       ? (current.canLaunch ? 'Ready to launch' : 'Sign in required')
       : current.ready.reason;
+  if (current.sessionNeedsRefresh && current.canLaunch && current.ready.ready) {
+    els.ready.textContent = 'Session will refresh on Play';
+  }
   els.launch.disabled = !current.canLaunch;
   els.prepare.disabled = !current.canPrepare;
 
