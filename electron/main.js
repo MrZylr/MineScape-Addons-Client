@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '5',
+  launcherVersion: '6',
   minecraftVersion: '26.1.2',
   fabricLoaderSelection: 'auto-stable',
   offlineDevLaunchEnabled: false,
@@ -37,6 +37,7 @@ const state = {
   activeUsername: '',
   login: null,
   prepareInProgress: false,
+  javaOverridePath: '',
   defaultResources: {
     checked: false,
     remoteVersion: '',
@@ -119,6 +120,19 @@ async function loadSessions() {
   const data = await readJson(file, { sessions: [], activeUsername: '' });
   state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
   state.activeUsername = data.activeUsername || state.sessions[0]?.username || '';
+}
+
+async function loadJavaRuntimePreference() {
+  const preference = await readJson(path.join(roots.metadata, 'java-runtime.json'), {});
+  state.javaOverridePath = typeof preference.javaBinary === 'string' ? preference.javaBinary : '';
+}
+
+async function saveJavaRuntimePreference(javaBinary) {
+  await mkdir(roots.metadata);
+  state.javaOverridePath = javaBinary || '';
+  await fs.writeFile(path.join(roots.metadata, 'java-runtime.json'), JSON.stringify({
+    javaBinary: state.javaOverridePath
+  }, null, 2));
 }
 
 async function saveSessions() {
@@ -735,6 +749,10 @@ async function prepareClient() {
     send('prepare-progress', 5);
     status(`Preparing client for instance ${path.basename(inst)}. Resolving version metadata...`);
     await resolveVersion();
+    const javaValidation = await ensureValidJavaForPreparation(state.resolvedVersion);
+    if (!javaValidation.ok) {
+      return { ok: false, message: javaValidation.message };
+    }
     send('prepare-progress', 20);
     status('Preparing client. Creating local directories...');
     await Promise.all([mkdir(roots.working), mkdir(roots.instances), mkdir(inst), mkdir(path.join(inst, 'mods')), mkdir(path.join(inst, 'metadata')), mkdir(roots.runtime), mkdir(roots.metadata)]);
@@ -952,13 +970,18 @@ async function launchMinecraft() {
     ...collectArgs(fabricRoot.jvm, vars)
   ]);
   const gameArgs = [...collectArgs(versionRoot.arguments?.game, vars), ...collectArgs(fabricRoot.game, vars)];
-  const java = path.join(process.env.JAVA_HOME || '', 'bin', 'java.exe');
-  const javaExe = fss.existsSync(java) ? java : 'java';
+  const javaExe = resolveJavaExecutable();
   const mainClass = fabricRoot.mainClass || versionRoot.mainClass;
   await mkdir(path.join(inst, 'logs'));
   await mkdir(path.join(inst, 'metadata'));
-  const log = fss.openSync(path.join(inst, 'logs', 'latest-client.log'), 'a');
-  const child = spawn(javaExe, [...jvmArgs, mainClass, ...gameArgs], { cwd: inst, stdio: ['ignore', log, log], windowsHide: false, detached: true });
+  const logPath = path.join(inst, 'logs', 'latest-client.log');
+  const log = fss.openSync(logPath, 'a');
+  const child = spawn(javaExe, [...jvmArgs, mainClass, ...gameArgs], {
+    cwd: inst,
+    stdio: ['ignore', log, log],
+    windowsHide: true,
+    detached: true
+  });
   await fs.writeFile(path.join(inst, 'metadata', 'active-client.pid'), String(child.pid));
   child.once('error', async error => {
     await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
@@ -967,14 +990,227 @@ async function launchMinecraft() {
   child.once('exit', async code => {
     await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
     if (code !== 0) {
-      status(`Minecraft exited with code ${code}. Check ${path.join(inst, 'logs', 'latest-client.log')}.`);
+      const logSummary = await readLaunchFailureSummary(logPath);
+      status(logSummary
+        ? `Minecraft exited with code ${code}. ${logSummary}`
+        : `Minecraft exited with code ${code}. Check ${logPath}.`);
     } else {
       status('Minecraft client closed.');
     }
     send('accounts', await publicState());
   });
   child.unref();
-  return `Minecraft launch started. Output is being written to ${path.join(inst, 'logs', 'latest-client.log')}.`;
+  return `Minecraft launch started. Output is being written to ${logPath}.`;
+}
+
+function resolveJavaExecutable() {
+  const preferred = candidateJavaBinaries();
+  for (const candidate of preferred) {
+    if (looksExecutable(candidate)) return candidate;
+  }
+  return process.platform === 'win32' ? 'javaw' : 'java';
+}
+
+function candidateJavaBinaries() {
+  const javaHome = process.env.JAVA_HOME || '';
+  return [
+    state.javaOverridePath,
+    path.join(javaHome, 'bin', 'javaw.exe'),
+    path.join(javaHome, 'bin', 'java.exe')
+  ].filter(Boolean);
+}
+
+function looksExecutable(candidate) {
+  if (!candidate) return false;
+  if (candidate.includes(path.sep)) {
+    return fss.existsSync(candidate);
+  }
+  return true;
+}
+
+async function ensureValidJavaForPreparation(resolvedVersion) {
+  const requiredMajor = Math.max(
+    Number(resolvedVersion?.minJavaVersion || 8),
+    Number(resolvedVersion?.minecraftJavaVersion || 8)
+  );
+  const selected = getJavaBinaryInfo(resolveJavaExecutable());
+  if (selected.ok && selected.majorVersion >= requiredMajor) {
+    return { ok: true };
+  }
+  const candidates = await findCompatibleJavaCandidates(requiredMajor);
+  showJavaRequirementWindow({
+    requiredMajor,
+    selected,
+    candidates
+  });
+  return {
+    ok: false,
+    message: `Java ${requiredMajor}+ is required.`
+  };
+}
+
+function getJavaBinaryInfo(javaBinary) {
+  if (!looksExecutable(javaBinary)) {
+    return {
+      ok: false,
+      javaBinary,
+      majorVersion: 0,
+      displayVersion: '',
+      reason: 'Java executable not found.'
+    };
+  }
+  const probe = spawnSync(javaBinary, ['-version'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 10000
+  });
+  const output = `${probe.stderr || ''}\n${probe.stdout || ''}`.trim();
+  const versionMatch = output.match(/version\s+"([^"]+)"/i) || output.match(/openjdk\s+([0-9][^\s]+)/i);
+  const displayVersion = versionMatch?.[1] || '';
+  const majorVersion = parseJavaMajorVersion(displayVersion);
+  return {
+    ok: probe.status === 0 || Boolean(displayVersion),
+    javaBinary,
+    majorVersion,
+    displayVersion,
+    reason: probe.error?.message || (probe.status && !displayVersion ? 'Unable to read Java version.' : '')
+  };
+}
+
+function parseJavaMajorVersion(versionText) {
+  if (!versionText) return 0;
+  const parts = versionText.split('.');
+  if (parts[0] === '1' && parts[1]) {
+    return Number(parts[1]) || 0;
+  }
+  return Number(parts[0]) || 0;
+}
+
+async function findCompatibleJavaCandidates(requiredMajor) {
+  const candidates = [];
+  const seen = new Set();
+  for (const candidate of discoverJavaBinaryCandidates()) {
+    const normalized = normalizeJavaCandidateKey(candidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    const info = getJavaBinaryInfo(candidate);
+    if (info.ok && info.majorVersion >= requiredMajor) {
+      candidates.push(info);
+    }
+  }
+  candidates.sort((left, right) => right.majorVersion - left.majorVersion || left.javaBinary.localeCompare(right.javaBinary));
+  return candidates;
+}
+
+async function findDiscoveredJavaCandidates() {
+  const candidates = [];
+  const seen = new Set();
+  for (const candidate of discoverJavaBinaryCandidates()) {
+    const normalized = normalizeJavaCandidateKey(candidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    const info = getJavaBinaryInfo(candidate);
+    if (info.ok) {
+      candidates.push(info);
+    }
+  }
+  candidates.sort((left, right) => right.majorVersion - left.majorVersion || left.javaBinary.localeCompare(right.javaBinary));
+  return candidates;
+}
+
+function discoverJavaBinaryCandidates() {
+  const candidates = [
+    state.javaOverridePath,
+    path.join(process.env.JAVA_HOME || '', 'bin', 'javaw.exe'),
+    path.join(process.env.JAVA_HOME || '', 'bin', 'java.exe')
+  ];
+  for (const command of ['javaw', 'java']) {
+    const whereResult = spawnSync('where', [command], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    for (const line of `${whereResult.stdout || ''}`.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
+      candidates.push(line);
+    }
+  }
+  for (const root of javaInstallRoots()) {
+    collectJavaBinaries(root, 3, candidates);
+  }
+  return candidates.filter(Boolean);
+}
+
+function normalizeJavaCandidateKey(candidate) {
+  if (!candidate) return '';
+  const lowered = candidate.toLowerCase();
+  if (!lowered.includes(path.sep)) {
+    return lowered;
+  }
+  try {
+    const resolved = fss.realpathSync.native ? fss.realpathSync.native(candidate) : fss.realpathSync(candidate);
+    const directory = path.dirname(resolved).toLowerCase();
+    if (path.basename(resolved).toLowerCase().startsWith('java')) {
+      return directory;
+    }
+    return resolved.toLowerCase();
+  } catch {
+    const directory = path.dirname(candidate).toLowerCase();
+    if (path.basename(candidate).toLowerCase().startsWith('java')) {
+      return directory;
+    }
+    return candidate.toLowerCase();
+  }
+}
+
+function javaInstallRoots() {
+  return [
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Eclipse Adoptium'),
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Java'),
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft'),
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Zulu'),
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Java'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Eclipse Adoptium'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Microsoft')
+  ].filter(Boolean);
+}
+
+function collectJavaBinaries(root, depth, results) {
+  if (!root || depth < 0 || !fss.existsSync(root)) return;
+  const javaw = path.join(root, 'bin', 'javaw.exe');
+  const java = path.join(root, 'bin', 'java.exe');
+  if (fss.existsSync(javaw)) results.push(javaw);
+  if (fss.existsSync(java)) results.push(java);
+  if (depth === 0) return;
+  let entries = [];
+  try {
+    entries = fss.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    collectJavaBinaries(path.join(root, entry.name), depth - 1, results);
+  }
+}
+
+async function readLaunchFailureSummary(logPath) {
+  try {
+    const content = await fs.readFile(logPath, 'utf8');
+    const lines = content.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      if (looksLikeLaunchFailure(line)) {
+        return line;
+      }
+    }
+  } catch {}
+  return '';
+}
+
+function looksLikeLaunchFailure(line) {
+  const lower = line.toLowerCase();
+  return lower.includes('error')
+    || lower.includes('exception')
+    || lower.includes('failed')
+    || lower.includes('unable to')
+    || lower.includes('could not')
+    || lower.includes('missing');
 }
 
 async function isRunning(inst) {
@@ -1225,6 +1461,12 @@ function buildApplicationMenu() {
             await shell.openPath(inst);
           }
         },
+        {
+          label: 'Choose Java Version',
+          click: async () => {
+            await openJavaRuntimeSelector();
+          }
+        },
         { type: 'separator' },
         { role: 'close' },
         { role: 'quit' }
@@ -1378,6 +1620,317 @@ function showInfoWindow(title, message) {
   infoWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 }
 
+function showJavaRequirementWindow(details) {
+  const candidates = details.candidates.map((candidate, index) => `
+    <div class="candidate">
+      <div class="candidate-copy">
+        <strong>Java ${escapeHtml(String(candidate.majorVersion))}</strong>
+        <span>${escapeHtml(candidate.displayVersion || candidate.javaBinary)}</span>
+        <code>${escapeHtml(candidate.javaBinary)}</code>
+      </div>
+      <button data-path="${escapeHtmlAttribute(candidate.javaBinary)}" ${index === 0 ? 'autofocus' : ''}>Use This Java</button>
+    </div>
+  `).join('');
+  const selectedSummary = details.selected.ok
+    ? `Current launcher Java: ${escapeHtml(details.selected.displayVersion || 'unknown')} at ${escapeHtml(details.selected.javaBinary || 'unknown')}`
+    : `Current launcher Java is not usable: ${escapeHtml(details.selected.reason || 'unknown problem')}`;
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Java Update Required</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101417;
+      color: #eff5fb;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      padding: 24px;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.94), rgba(20, 27, 31, 0.94));
+      min-height: 100vh;
+    }
+    h1 {
+      margin: 0 0 10px;
+      color: #67d29d;
+      font-size: 22px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #b7c1cb;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    a {
+      color: #e4c45d;
+      text-decoration: none;
+    }
+    .panel {
+      margin-top: 16px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.05);
+      padding: 14px;
+    }
+    .candidate {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 0;
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+    .candidate:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .candidate-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    strong {
+      font-size: 14px;
+    }
+    code {
+      color: #c9d3dc;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .actions-right {
+      display: flex;
+      gap: 10px;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      color: #07110b;
+      background: #67d29d;
+    }
+    button.secondary {
+      color: #eff5fb;
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.15);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Java update required</h1>
+    <p>Minecraft ${escapeHtml(CONFIG.minecraftVersion)} requires Java ${escapeHtml(String(details.requiredMajor))} or newer before Prepare Client can continue.</p>
+    <p>${selectedSummary}</p>
+    <p><a href="https://adoptium.net/temurin/releases" id="download-link">Download Java from Adoptium</a></p>
+    <div class="panel">
+      ${candidates || '<p>No compatible Java install was found automatically.</p>'}
+    </div>
+    <div class="actions">
+      <button class="secondary" id="download-button">Open Adoptium</button>
+      <div class="actions-right">
+        <button class="secondary" id="close-button">Close</button>
+      </div>
+    </div>
+  </main>
+  <script>
+    const { ipcRenderer, shell } = require('electron');
+    document.getElementById('download-button').addEventListener('click', () => {
+      shell.openExternal('https://adoptium.net/temurin/releases');
+    });
+    document.getElementById('download-link').addEventListener('click', event => {
+      event.preventDefault();
+      shell.openExternal('https://adoptium.net/temurin/releases');
+    });
+    document.getElementById('close-button').addEventListener('click', () => window.close());
+    for (const button of document.querySelectorAll('[data-path]')) {
+      button.addEventListener('click', async () => {
+        await ipcRenderer.invoke('java:select-runtime', button.dataset.path);
+        window.close();
+      });
+    }
+  </script>
+</body>
+</html>`;
+  const window = new BrowserWindow({
+    width: 760,
+    height: 560,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: state.win,
+    modal: true,
+    title: 'Java Update Required',
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true
+    }
+  });
+  window.setMenuBarVisibility(false);
+  window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
+async function openJavaRuntimeSelector() {
+  const candidates = await findDiscoveredJavaCandidates();
+  showJavaSelectionWindow(candidates);
+}
+
+function showJavaSelectionWindow(candidates) {
+  const currentJava = resolveJavaExecutable();
+  const candidateMarkup = candidates.map((candidate, index) => `
+    <div class="candidate">
+      <div class="candidate-copy">
+        <strong>Java ${escapeHtml(String(candidate.majorVersion))}</strong>
+        <span>${escapeHtml(candidate.displayVersion || candidate.javaBinary)}</span>
+        <code>${escapeHtml(candidate.javaBinary)}</code>
+      </div>
+      <button data-path="${escapeHtmlAttribute(candidate.javaBinary)}" ${(candidate.javaBinary === state.javaOverridePath || (!state.javaOverridePath && candidate.javaBinary === currentJava) || index === 0) ? 'autofocus' : ''}>Use This Java</button>
+    </div>
+  `).join('');
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Choose Java Version</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101417;
+      color: #eff5fb;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      padding: 24px;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.94), rgba(20, 27, 31, 0.94));
+      min-height: 100vh;
+    }
+    h1 {
+      margin: 0 0 10px;
+      color: #67d29d;
+      font-size: 22px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #b7c1cb;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    .panel {
+      margin-top: 16px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.05);
+      padding: 14px;
+    }
+    .candidate {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 0;
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+    .candidate:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .candidate-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    strong {
+      font-size: 14px;
+    }
+    code {
+      color: #c9d3dc;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      color: #eff5fb;
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.15);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Choose Java Version</h1>
+    <p>Select a Java runtime discovered from Program Files, \`JAVA_HOME\`, or the system path.</p>
+    <p>Current launcher Java: ${escapeHtml(currentJava)}</p>
+    <div class="panel">
+      ${candidateMarkup || '<p>No Java installations were found automatically.</p>'}
+    </div>
+    <div class="actions">
+      <button class="secondary" id="close-button">Close</button>
+    </div>
+  </main>
+  <script>
+    const { ipcRenderer } = require('electron');
+    document.getElementById('close-button').addEventListener('click', () => window.close());
+    for (const button of document.querySelectorAll('[data-path]')) {
+      button.addEventListener('click', async () => {
+        await ipcRenderer.invoke('java:select-runtime', button.dataset.path);
+        window.close();
+      });
+    }
+  </script>
+</body>
+</html>`;
+  const window = new BrowserWindow({
+    width: 760,
+    height: 560,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: state.win,
+    modal: true,
+    title: 'Choose Java Version',
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true
+    }
+  });
+  window.setMenuBarVisibility(false);
+  window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
+function escapeHtmlAttribute(value) {
+  return escapeHtml(value).replaceAll('`', '&#96;');
+}
+
 ipcMain.handle('app:state', publicState);
 ipcMain.handle('app:blog', fetchBlog);
 ipcMain.handle('auth:login', beginLogin);
@@ -1410,6 +1963,11 @@ ipcMain.handle('mods:settings', async (_event, settings) => {
   return publicState();
 });
 ipcMain.handle('mods:check-version', async (_event, modId, offset) => checkModVersion(modId, offset));
+ipcMain.handle('java:select-runtime', async (_event, javaBinary) => {
+  await saveJavaRuntimePreference(javaBinary);
+  status(`Using Java from ${javaBinary}`);
+  return { ok: true };
+});
 ipcMain.handle('launch:start', async () => {
   try {
     const message = await launchMinecraft();
@@ -1424,6 +1982,7 @@ ipcMain.handle('shell:open', (_event, url) => shell.openExternal(url));
 
 app.whenReady().then(async () => {
   await loadSessions();
+  await loadJavaRuntimePreference();
   createWindow();
   checkLauncherVersion()
     .then(result => {
