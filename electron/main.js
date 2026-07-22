@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '6',
+  launcherVersion: '7',
   minecraftVersion: '26.1.2',
   fabricLoaderSelection: 'auto-stable',
   offlineDevLaunchEnabled: false,
@@ -660,6 +660,43 @@ async function checkModVersion(modId, offset) {
     offset: target?.offset ?? normalizeVersionOffset(offset),
     prepareRequired
   };
+}
+
+async function checkManagedModUpdates(inst = instanceDirectory()) {
+  const settings = await loadSettings(inst);
+  const updates = [];
+  if (settings.vanillaLaunch) {
+    return updates;
+  }
+  for (const mod of bundledMods) {
+    if (settings.enabledMods[mod.id] === false) {
+      continue;
+    }
+    const installedFile = await installedFileFor(mod.id, inst);
+    if (!installedFile) {
+      continue;
+    }
+    const installedPath = path.join(inst, 'mods', installedFile);
+    if (!(await exists(installedPath))) {
+      continue;
+    }
+    let target = null;
+    try {
+      target = await resolveModrinthFile(mod, settings.versionOffsets?.[mod.id]);
+    } catch {
+      continue;
+    }
+    if (!target?.filename || target.filename === installedFile) {
+      continue;
+    }
+    updates.push({
+      modId: mod.id,
+      installedFile,
+      targetFile: target.filename,
+      targetVersion: target.versionNumber || ''
+    });
+  }
+  return updates;
 }
 
 async function listFiles(dir) {
@@ -1620,6 +1657,102 @@ function showInfoWindow(title, message) {
   infoWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 }
 
+function showModUpdatesWindow(updates) {
+  const rows = updates.map(update => `
+    <li>
+      <strong>${escapeHtml(update.modId)}</strong><br>
+      <span>Current Version: ${escapeHtml(update.installedFile)}</span><br>
+      <span>Latest Version: ${escapeHtml(update.targetFile)}${update.targetVersion ? ` (${escapeHtml(update.targetVersion)})` : ''}</span>
+    </li>
+  `).join('');
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mod Updates Available</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101417;
+      color: #eff5fb;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      padding: 24px;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.94), rgba(20, 27, 31, 0.94));
+      min-height: 100vh;
+    }
+    h1 {
+      margin: 0 0 10px;
+      color: #67d29d;
+      font-size: 22px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #b7c1cb;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    ul {
+      margin: 16px 0 0;
+      padding-left: 20px;
+    }
+    li {
+      margin-bottom: 12px;
+      color: #dbe3ea;
+      line-height: 1.5;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 24px;
+    }
+    button {
+      min-width: 86px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 10px 16px;
+      color: #07110b;
+      background: #67d29d;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Mod updates available</h1>
+    <p>The following managed mods have newer selected versions available. Press Prepare Client to update them, or ignore this message to stay on the current version.</p>
+    <ul>${rows}</ul>
+    <div class="actions">
+      <button onclick="window.close()">OK</button>
+    </div>
+  </main>
+</body>
+</html>`;
+  const window = new BrowserWindow({
+    width: 640,
+    height: 520,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: state.win,
+    modal: true,
+    title: 'Mod Updates Available',
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  window.setMenuBarVisibility(false);
+  window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
 function showJavaRequirementWindow(details) {
   const candidates = details.candidates.map((candidate, index) => `
     <div class="candidate">
@@ -1997,6 +2130,13 @@ app.whenReady().then(async () => {
       send('accounts', await publicState());
     })
     .catch(error => status(`GitHub resource version check failed: ${error.message}`));
+  checkManagedModUpdates()
+    .then(updates => {
+      if (updates.length > 0) {
+        showModUpdatesWindow(updates);
+      }
+    })
+    .catch(() => {});
 });
 
 function configUpdateRequiredMessage() {
