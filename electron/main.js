@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '7',
+  launcherVersion: '8',
   minecraftVersion: '26.1.2',
   defaultMaxMemoryMb: 4096,
   fabricLoaderSelection: 'auto-stable',
