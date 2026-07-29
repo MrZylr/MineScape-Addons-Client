@@ -11,6 +11,7 @@ const CONFIG = {
   clientName: 'MineScape Addons',
   launcherVersion: '7',
   minecraftVersion: '26.1.2',
+  defaultMaxMemoryMb: 4096,
   fabricLoaderSelection: 'auto-stable',
   offlineDevLaunchEnabled: false,
   offlineDevUsername: 'Zylr',
@@ -38,6 +39,10 @@ const state = {
   login: null,
   prepareInProgress: false,
   javaOverridePath: '',
+  launchPreferences: {
+    maxMemoryMb: CONFIG.defaultMaxMemoryMb,
+    extraJvmArgs: ''
+  },
   defaultResources: {
     checked: false,
     remoteVersion: '',
@@ -133,6 +138,30 @@ async function saveJavaRuntimePreference(javaBinary) {
   await fs.writeFile(path.join(roots.metadata, 'java-runtime.json'), JSON.stringify({
     javaBinary: state.javaOverridePath
   }, null, 2));
+}
+
+async function loadLaunchPreferences() {
+  const saved = await readJson(path.join(roots.metadata, 'launch-settings.json'), {});
+  const maxMemoryMb = Number(saved.maxMemoryMb);
+  state.launchPreferences = {
+    maxMemoryMb: Number.isFinite(maxMemoryMb) && maxMemoryMb > 0
+      ? Math.floor(maxMemoryMb)
+      : CONFIG.defaultMaxMemoryMb,
+    extraJvmArgs: typeof saved.extraJvmArgs === 'string' ? saved.extraJvmArgs : ''
+  };
+}
+
+async function saveLaunchPreferences(preferences = {}) {
+  await mkdir(roots.metadata);
+  const maxMemoryMb = Number(preferences.maxMemoryMb);
+  state.launchPreferences = {
+    maxMemoryMb: Number.isFinite(maxMemoryMb) && maxMemoryMb > 0
+      ? Math.floor(maxMemoryMb)
+      : CONFIG.defaultMaxMemoryMb,
+    extraJvmArgs: typeof preferences.extraJvmArgs === 'string' ? preferences.extraJvmArgs.trim() : ''
+  };
+  await fs.writeFile(path.join(roots.metadata, 'launch-settings.json'), JSON.stringify(state.launchPreferences, null, 2));
+  return state.launchPreferences;
 }
 
 async function saveSessions() {
@@ -928,17 +957,67 @@ function collectArgs(values, variables) {
   return out;
 }
 
-function normalizeJvmArgs(args) {
+function normalizeJvmArgs(args, preferredMaxMemoryMb = null) {
   const normalized = [];
   let gcSelected = false;
+  const forcedMaxHeap = Number.isFinite(preferredMaxMemoryMb) && preferredMaxMemoryMb > 0
+    ? `-Xmx${Math.floor(preferredMaxMemoryMb)}M`
+    : '';
+  let maxHeapSelected = false;
   for (const arg of args) {
+    if (/^-Xmx/i.test(arg)) {
+      if (forcedMaxHeap || maxHeapSelected) continue;
+      maxHeapSelected = true;
+    }
     if (isGarbageCollectorArg(arg)) {
       if (gcSelected) continue;
       gcSelected = true;
     }
     normalized.push(arg);
   }
+  if (forcedMaxHeap) {
+    normalized.unshift(forcedMaxHeap);
+  } else if (!maxHeapSelected && Number.isFinite(CONFIG.defaultMaxMemoryMb) && CONFIG.defaultMaxMemoryMb > 0) {
+    normalized.unshift(`-Xmx${Math.floor(CONFIG.defaultMaxMemoryMb)}M`);
+  }
   return normalized;
+}
+
+function tokenizeLaunchArgs(raw) {
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (quote) {
+      if (char === quote) {
+        quote = '';
+        continue;
+      }
+      if (char === '\\' && i + 1 < raw.length && raw[i + 1] === quote) {
+        current += raw[i + 1];
+        i += 1;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === '\'') {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (quote) throw new Error('Launch args contain an unclosed quote.');
+  if (current) tokens.push(current);
+  return tokens;
 }
 
 function isGarbageCollectorArg(arg) {
@@ -1004,8 +1083,9 @@ async function launchMinecraft() {
   const jvmArgs = normalizeJvmArgs([
     ...collectArgs(versionRoot.arguments?.['default-user-jvm'], vars),
     ...collectArgs(versionRoot.arguments?.jvm, vars),
-    ...collectArgs(fabricRoot.jvm, vars)
-  ]);
+    ...collectArgs(fabricRoot.jvm, vars),
+    ...tokenizeLaunchArgs(state.launchPreferences.extraJvmArgs || '')
+  ], state.launchPreferences.maxMemoryMb);
   const gameArgs = [...collectArgs(versionRoot.arguments?.game, vars), ...collectArgs(fabricRoot.game, vars)];
   const javaExe = resolveJavaExecutable();
   const mainClass = fabricRoot.mainClass || versionRoot.mainClass;
@@ -1504,6 +1584,12 @@ function buildApplicationMenu() {
             await openJavaRuntimeSelector();
           }
         },
+        {
+          label: 'Adjust Launch Args',
+          click: async () => {
+            await openLaunchArgsWindow();
+          }
+        },
         { type: 'separator' },
         { role: 'close' },
         { role: 'quit' }
@@ -1655,6 +1741,163 @@ function showInfoWindow(title, message) {
 </body>
 </html>`;
   infoWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
+async function openLaunchArgsWindow() {
+  await loadLaunchPreferences();
+  showLaunchArgsWindow(state.launchPreferences);
+}
+
+function showLaunchArgsWindow(preferences) {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adjust Launch Args</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101417;
+      color: #eff5fb;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      padding: 24px;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.94), rgba(20, 27, 31, 0.94));
+      min-height: 100vh;
+    }
+    h1 {
+      margin: 0 0 10px;
+      color: #67d29d;
+      font-size: 22px;
+    }
+    p {
+      margin: 0 0 14px;
+      color: #b7c1cb;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    .field {
+      display: grid;
+      gap: 8px;
+      margin-top: 18px;
+    }
+    label {
+      color: #dbe3ea;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    input, textarea {
+      width: 100%;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: #eff5fb;
+      background: rgba(255,255,255,0.06);
+      font: inherit;
+    }
+    textarea {
+      min-height: 140px;
+      resize: vertical;
+    }
+    .hint {
+      color: #9eadb9;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 22px;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      color: #07110b;
+      background: #67d29d;
+    }
+    button.secondary {
+      color: #eff5fb;
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.15);
+    }
+    #status {
+      min-height: 18px;
+      margin-top: 14px;
+      color: #e4c45d;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Adjust Launch Args</h1>
+    <p>Set the default max RAM and any extra JVM launch arguments for Minecraft.</p>
+    <div class="field">
+      <label for="max-memory">Max RAM (MB)</label>
+      <input id="max-memory" type="number" min="512" step="256" value="${escapeHtmlAttribute(String(preferences.maxMemoryMb || CONFIG.defaultMaxMemoryMb))}">
+      <div class="hint">This value controls the JVM <code>-Xmx</code> heap limit.</div>
+    </div>
+    <div class="field">
+      <label for="extra-jvm-args">Extra JVM Args</label>
+      <textarea id="extra-jvm-args" spellcheck="false" placeholder="-XX:+UseG1GC -Dexample=true">${escapeHtml(preferences.extraJvmArgs || '')}</textarea>
+      <div class="hint">Space-separated JVM arguments. Quotes are supported. Any <code>-Xmx</code> value here is ignored in favor of the RAM field above.</div>
+    </div>
+    <div id="status"></div>
+    <div class="actions">
+      <button class="secondary" id="cancel-button">Close</button>
+      <button class="primary" id="save-button">Save</button>
+    </div>
+  </main>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const maxMemory = document.getElementById('max-memory');
+    const extraArgs = document.getElementById('extra-jvm-args');
+    const status = document.getElementById('status');
+    document.getElementById('cancel-button').addEventListener('click', () => window.close());
+    document.getElementById('save-button').addEventListener('click', async () => {
+      status.textContent = '';
+      const payload = {
+        maxMemoryMb: Number(maxMemory.value),
+        extraJvmArgs: extraArgs.value
+      };
+      try {
+        await ipcRenderer.invoke('launch-settings:save', payload);
+        status.textContent = 'Saved.';
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>`;
+  const window = new BrowserWindow({
+    width: 700,
+    height: 500,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: state.win,
+    modal: true,
+    title: 'Adjust Launch Args',
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true
+    }
+  });
+  window.setMenuBarVisibility(false);
+  window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
 }
 
 function showModUpdatesWindow(updates) {
@@ -2101,6 +2344,20 @@ ipcMain.handle('java:select-runtime', async (_event, javaBinary) => {
   status(`Using Java from ${javaBinary}`);
   return { ok: true };
 });
+ipcMain.handle('launch-settings:save', async (_event, preferences) => {
+  const maxMemoryMb = Number(preferences?.maxMemoryMb);
+  if (!Number.isFinite(maxMemoryMb) || maxMemoryMb < 512) {
+    throw new Error('Max RAM must be at least 512 MB.');
+  }
+  const extraJvmArgs = typeof preferences?.extraJvmArgs === 'string' ? preferences.extraJvmArgs : '';
+  tokenizeLaunchArgs(extraJvmArgs);
+  const saved = await saveLaunchPreferences({
+    maxMemoryMb,
+    extraJvmArgs
+  });
+  status(`Launch settings saved. Max RAM ${saved.maxMemoryMb} MB.`);
+  return saved;
+});
 ipcMain.handle('launch:start', async () => {
   try {
     const message = await launchMinecraft();
@@ -2116,6 +2373,7 @@ ipcMain.handle('shell:open', (_event, url) => shell.openExternal(url));
 app.whenReady().then(async () => {
   await loadSessions();
   await loadJavaRuntimePreference();
+  await loadLaunchPreferences();
   createWindow();
   checkLauncherVersion()
     .then(result => {
