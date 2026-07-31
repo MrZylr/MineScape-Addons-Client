@@ -1,4 +1,5 @@
-const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const crypto = require('crypto');
 const fs = require('fs/promises');
 const fss = require('fs');
@@ -9,7 +10,6 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '9',
   minecraftVersion: '26.1.2',
   defaultMaxMemoryMb: 4096,
   fabricLoaderSelection: 'auto-stable',
@@ -22,7 +22,8 @@ const CONFIG = {
   userAgent: 'MineScape AddonsLauncher/1.0'
 };
 
-const LAUNCHER_UPDATE_URL = 'https://github.com/MrZylr/MineScape-Addons-Client';
+const APP_VERSION = app.getVersion();
+const GITHUB_RELEASES_URL = 'https://github.com/MrZylr/MineScape-Addons-Client/releases/latest';
 
 const roots = {
   working: path.join(os.homedir(), '.minescape_addons'),
@@ -42,6 +43,14 @@ const state = {
   launchPreferences: {
     maxMemoryMb: CONFIG.defaultMaxMemoryMb,
     extraJvmArgs: ''
+  },
+  launcherUpdate: {
+    checkInProgress: false,
+    manualCheckInProgress: false,
+    downloadInProgress: false,
+    availableVersion: '',
+    downloadedVersion: '',
+    promptVisible: false
   },
   defaultResources: {
     checked: false,
@@ -441,122 +450,157 @@ async function fetchGithubDefaultsVersion() {
   }
 }
 
-async function checkLauncherVersion() {
-  const remoteVersion = await fetchGithubTextFile('launcher_version');
-  const localVersion = CONFIG.launcherVersion;
-  return {
-    remoteVersion,
-    localVersion,
-    updateRequired: Boolean(remoteVersion && localVersion !== remoteVersion)
-  };
+function isLauncherUpdaterAvailable() {
+  return app.isPackaged;
 }
 
-async function fetchGithubTextFile(remotePath) {
+async function showLauncherUpdateAvailablePrompt(info) {
+  if (state.launcherUpdate.promptVisible) return;
+  state.launcherUpdate.promptVisible = true;
   try {
-    return (await fetchText(`${githubDefaultsRawUrl(remotePath)}?t=${Date.now()}`, {
-      headers: { 'User-Agent': CONFIG.userAgent, 'Cache-Control': 'no-cache' }
-    })).trim();
-  } catch {
-    return '';
+    const version = info?.version || state.launcherUpdate.availableVersion || 'unknown';
+    const result = await dialog.showMessageBox(state.win, {
+      type: 'info',
+      buttons: ['Download Update', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Launcher Update Available',
+      message: 'Launcher update available',
+      detail: `You are running launcher version ${APP_VERSION}. Version ${version} is available.\n\nDownload and prepare the update now?`
+    });
+    if (result.response === 0) {
+      status(`Downloading launcher update ${version}...`);
+      await autoUpdater.downloadUpdate();
+    }
+  } catch (error) {
+    status(`Launcher update failed: ${error.message}`);
+  } finally {
+    state.launcherUpdate.promptVisible = false;
+    state.launcherUpdate.manualCheckInProgress = false;
   }
 }
 
-function showLauncherUpdateWindow(versionCheck) {
-  const updateWindow = new BrowserWindow({
-    width: 460,
-    height: 280,
-    resizable: false,
-    minimizable: false,
-    maximizable: false,
-    parent: state.win,
-    modal: true,
-    title: 'Launcher Update Available',
-    icon: assetPath('assets', 'logo', 'icon.ico'),
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false
+async function showLauncherUpdateReadyPrompt(info) {
+  if (state.launcherUpdate.promptVisible) return;
+  state.launcherUpdate.promptVisible = true;
+  try {
+    const version = info?.version || state.launcherUpdate.downloadedVersion || state.launcherUpdate.availableVersion || 'unknown';
+    const result = await dialog.showMessageBox(state.win, {
+      type: 'info',
+      buttons: ['Restart and Install', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Launcher Update Ready',
+      message: 'Launcher update downloaded',
+      detail: `Version ${version} has been downloaded.\n\nRestart the launcher now to install it?`
+    });
+    if (result.response === 0) {
+      autoUpdater.quitAndInstall();
     }
+  } finally {
+    state.launcherUpdate.promptVisible = false;
+  }
+}
+
+function initializeLauncherUpdater() {
+  if (!isLauncherUpdaterAvailable()) return;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on('checking-for-update', () => {
+    state.launcherUpdate.checkInProgress = true;
+    status('Checking for launcher update...');
   });
-  updateWindow.setMenuBarVisibility(false);
-  updateWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
-    return { action: 'deny' };
+
+  autoUpdater.on('update-available', async info => {
+    state.launcherUpdate.checkInProgress = false;
+    state.launcherUpdate.availableVersion = info?.version || '';
+    await showLauncherUpdateAvailablePrompt(info);
   });
-  updateWindow.webContents.on('will-navigate', event => {
-    event.preventDefault();
+
+  autoUpdater.on('update-not-available', () => {
+    state.launcherUpdate.checkInProgress = false;
+    state.launcherUpdate.availableVersion = '';
+    if (state.launcherUpdate.manualCheckInProgress) {
+      showInfoWindow(
+        'Launcher is up to date',
+        `You are running launcher version ${APP_VERSION}.`
+      );
+    }
+    state.launcherUpdate.manualCheckInProgress = false;
   });
-  const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Launcher Update Available</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: #101417;
-      color: #eff5fb;
-      font-family: "Segoe UI", Arial, sans-serif;
+
+  autoUpdater.on('download-progress', progress => {
+    state.launcherUpdate.downloadInProgress = true;
+    const version = state.launcherUpdate.availableVersion ? ` ${state.launcherUpdate.availableVersion}` : '';
+    status(`Downloading launcher update${version}... ${Math.round(progress.percent)}%`);
+  });
+
+  autoUpdater.on('update-downloaded', async info => {
+    state.launcherUpdate.downloadInProgress = false;
+    state.launcherUpdate.downloadedVersion = info?.version || state.launcherUpdate.availableVersion || '';
+    status(`Launcher update ${state.launcherUpdate.downloadedVersion || ''} is ready to install.`);
+    await showLauncherUpdateReadyPrompt(info);
+  });
+
+  autoUpdater.on('error', error => {
+    state.launcherUpdate.checkInProgress = false;
+    state.launcherUpdate.downloadInProgress = false;
+    const message = error?.message || String(error);
+    status(`Launcher update failed: ${message}`);
+    if (state.launcherUpdate.manualCheckInProgress) {
+      showInfoWindow('Launcher update failed', message);
     }
-    main {
-      width: 100%;
-      height: 100%;
-      padding: 24px;
-      border-top: 1px solid rgba(255, 255, 255, 0.15);
-      background: linear-gradient(90deg, rgba(5, 8, 10, 0.94), rgba(20, 27, 31, 0.94));
+    state.launcherUpdate.manualCheckInProgress = false;
+  });
+}
+
+async function checkForLauncherUpdates({ userInitiated = false } = {}) {
+  if (!isLauncherUpdaterAvailable()) {
+    if (userInitiated) {
+      showInfoWindow(
+        'Launcher update unavailable',
+        'Auto-update is only available in the packaged installer build.'
+      );
     }
-    h1 {
-      margin: 0 0 10px;
-      color: #67d29d;
-      font-size: 22px;
-      letter-spacing: 0;
+    return null;
+  }
+  if (state.launcherUpdate.downloadedVersion) {
+    await showLauncherUpdateReadyPrompt({ version: state.launcherUpdate.downloadedVersion });
+    return null;
+  }
+  if (state.launcherUpdate.downloadInProgress) {
+    if (userInitiated) {
+      showInfoWindow(
+        'Launcher update in progress',
+        `The launcher update is still downloading${state.launcherUpdate.availableVersion ? ` (version ${state.launcherUpdate.availableVersion})` : ''}.`
+      );
     }
-    p {
-      margin: 0 0 14px;
-      color: #b7c1cb;
-      line-height: 1.5;
-      font-size: 14px;
+    return null;
+  }
+  if (state.launcherUpdate.availableVersion) {
+    await showLauncherUpdateAvailablePrompt({ version: state.launcherUpdate.availableVersion });
+    return null;
+  }
+  if (state.launcherUpdate.checkInProgress) {
+    if (userInitiated) {
+      showInfoWindow('Launcher update in progress', 'A launcher update check is already running.');
     }
-    a {
-      color: #e4c45d;
-      text-decoration: none;
-      overflow-wrap: anywhere;
+    return null;
+  }
+  state.launcherUpdate.manualCheckInProgress = userInitiated;
+  try {
+    return await autoUpdater.checkForUpdates();
+  } catch (error) {
+    state.launcherUpdate.checkInProgress = false;
+    state.launcherUpdate.manualCheckInProgress = false;
+    if (userInitiated) {
+      showInfoWindow('Launcher update failed', error.message);
+    } else {
+      status(`Launcher update failed: ${error.message}`);
     }
-    .actions {
-      display: flex;
-      justify-content: flex-end;
-      margin-top: 22px;
-    }
-    button {
-      min-width: 86px;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      padding: 10px 16px;
-      color: #07110b;
-      background: #67d29d;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Launcher update available</h1>
-    <p>Your launcher version is ${escapeHtml(versionCheck.localVersion || 'none')}. The latest version is ${escapeHtml(versionCheck.remoteVersion)}.</p>
-    <p><a href="${LAUNCHER_UPDATE_URL}" target="_blank" rel="noreferrer">Open launcher update page</a></p>
-    <div class="actions">
-      <button onclick="window.close()">OK</button>
-    </div>
-  </main>
-</body>
-</html>`;
-  updateWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    return null;
+  }
 }
 
 function escapeHtml(value) {
@@ -1637,21 +1681,13 @@ function buildApplicationMenu() {
         {
           label: 'Check for Update',
           click: async () => {
-            const result = await checkLauncherVersion();
-            if (result.updateRequired) {
-              showLauncherUpdateWindow(result);
-              return;
-            }
-            showInfoWindow(
-              'Launcher is up to date',
-              `You are running launcher version ${result.localVersion || CONFIG.launcherVersion}.`
-            );
+            await checkForLauncherUpdates({ userInitiated: true });
           }
         },
         {
-          label: 'Update Launcher',
+          label: 'Open Releases Page',
           click: async () => {
-            await shell.openExternal('https://github.com/MrZylr/MineScape-Addons-Client');
+            await shell.openExternal(GITHUB_RELEASES_URL);
           }
         }
       ]
@@ -2375,11 +2411,8 @@ app.whenReady().then(async () => {
   await loadJavaRuntimePreference();
   await loadLaunchPreferences();
   createWindow();
-  checkLauncherVersion()
-    .then(result => {
-      if (result.updateRequired) showLauncherUpdateWindow(result);
-    })
-    .catch(() => {});
+  initializeLauncherUpdater();
+  checkForLauncherUpdates().catch(() => {});
   checkDefaultResourceVersion()
     .then(async result => {
       if (result.prepareRequired) {
