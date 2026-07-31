@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const CONFIG = {
   clientName: 'MineScape Addons',
-  launcherVersion: '8',
+  launcherVersion: '9',
   minecraftVersion: '26.1.2',
   defaultMaxMemoryMb: 4096,
   fabricLoaderSelection: 'auto-stable',
@@ -347,7 +347,7 @@ const bundledMods = [
   ['Default Options', 'https://modrinth.com/mod/default-options', 0],
   ['Fancy Menu', 'https://modrinth.com/mod/fancymenu', 0],
   ['Konkrete', 'https://modrinth.com/mod/konkrete', 0],
-  ['MCEF', 'https://modrinth.com/mod/mcef-keksuccino', 0],
+  ['MCEF', 'https://modrinth.com/mod/rinku', 0],
   ['Melody', 'https://modrinth.com/mod/melody', 0],
   ['Prickle', 'https://modrinth.com/mod/prickle', 0],
   ['Xaeros Minimap', 'https://modrinth.com/mod/xaeros-minimap', 0],
