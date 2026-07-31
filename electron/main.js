@@ -24,6 +24,7 @@ const CONFIG = {
 
 const APP_VERSION = app.getVersion();
 const GITHUB_RELEASES_URL = 'https://github.com/MrZylr/MineScape-Addons-Client/releases/latest';
+const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/MrZylr/MineScape-Addons-Client/releases/latest';
 
 const roots = {
   working: path.join(os.homedir(), '.minescape_addons'),
@@ -348,23 +349,23 @@ async function prepareRuntime() {
 }
 
 const bundledMods = [
-  ['Fabric-API', 'https://modrinth.com/mod/fabric-api', 0],
-  ['Balm', 'https://modrinth.com/mod/balm', 0],
-  ['Sodium', 'https://modrinth.com/mod/sodium', 0],
-  ['Iris', 'https://modrinth.com/mod/iris', 0],
-  ['Bookshelf', 'https://modrinth.com/mod/bookshelf-lib', 0],
-  ['Default Options', 'https://modrinth.com/mod/default-options', 0],
-  ['Fancy Menu', 'https://modrinth.com/mod/fancymenu', 0],
-  ['Konkrete', 'https://modrinth.com/mod/konkrete', 0],
-  ['MCEF', 'https://modrinth.com/mod/rinku', 0],
-  ['Melody', 'https://modrinth.com/mod/melody', 0],
-  ['Prickle', 'https://modrinth.com/mod/prickle', 0],
-  ['Xaeros Minimap', 'https://modrinth.com/mod/xaeros-minimap', 0],
-  ['Xaeros World Map', 'https://modrinth.com/mod/xaeros-world-map', 0],
-  ['Auth Me', 'https://modrinth.com/mod/auth-me', 0],
-  ['No Chat Restrictions', 'https://modrinth.com/mod/no-chat-restrictions', 0],
-  ['Minescape Utility', 'https://modrinth.com/mod/minescapeutility', 0]
-].map(([id, source, versionOffset]) => ({ id, fileName: '', source, required: true, versionOffset }));
+  ['Fabric-API', 'P7dR8mSH', 0],
+  ['Balm', 'MBAkmtvl', 0],
+  ['Sodium', 'AANobbMI', 0],
+  ['Iris', 'YL57xq9U', 0],
+  ['Bookshelf', 'uy4Cnpcm', 0],
+  ['Default Options', 'WEg59z5b', 0],
+  ['Fancy Menu', 'Wq5SjeWM', 0],
+  ['Konkrete', 'J81TRJWm', 0],
+  ['MCEF', 'bQhBuv7x', 0],
+  ['Melody', 'CVT4pFB2', 0],
+  ['Prickle', 'aaRl8GiW', 0],
+  ['Xaeros Minimap', '1bokaNcj', 0],
+  ['Xaeros World Map', 'NcUtCpym', 0],
+  ['Auth Me', 'yjgIrBjZ', 0],
+  ['No Chat Restrictions', 'z440MEwJ', 0],
+  ['Minescape Utility', 'k1fd88kQ', 0]
+].map(([id, projectId, versionOffset]) => ({ id, fileName: '', projectId, required: true, versionOffset }));
 
 function manifest() {
   const resolved = state.resolvedVersion;
@@ -459,16 +460,18 @@ async function showLauncherUpdateAvailablePrompt(info) {
   state.launcherUpdate.promptVisible = true;
   try {
     const version = info?.version || state.launcherUpdate.availableVersion || 'unknown';
-    const result = await dialog.showMessageBox(state.win, {
-      type: 'info',
-      buttons: ['Download Update', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
+    const response = await showLauncherPromptWindow({
       title: 'Launcher Update Available',
-      message: 'Launcher update available',
-      detail: `You are running launcher version ${APP_VERSION}. Version ${version} is available.\n\nDownload and prepare the update now?`
+      heading: 'Launcher update available',
+      detail: `You are running launcher version ${APP_VERSION}. Version ${version} is available.\n\nDownload and prepare the update now?`,
+      buttons: [
+        { label: 'Download Update', variant: 'primary' },
+        { label: 'Later', variant: 'secondary' }
+      ],
+      width: 520,
+      height: 320
     });
-    if (result.response === 0) {
+    if (response === 0) {
       status(`Downloading launcher update ${version}...`);
       await autoUpdater.downloadUpdate();
     }
@@ -485,16 +488,18 @@ async function showLauncherUpdateReadyPrompt(info) {
   state.launcherUpdate.promptVisible = true;
   try {
     const version = info?.version || state.launcherUpdate.downloadedVersion || state.launcherUpdate.availableVersion || 'unknown';
-    const result = await dialog.showMessageBox(state.win, {
-      type: 'info',
-      buttons: ['Restart and Install', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
+    const response = await showLauncherPromptWindow({
       title: 'Launcher Update Ready',
-      message: 'Launcher update downloaded',
-      detail: `Version ${version} has been downloaded.\n\nRestart the launcher now to install it?`
+      heading: 'Launcher update downloaded',
+      detail: `Version ${version} has been downloaded.\n\nRestart the launcher now to install it?`,
+      buttons: [
+        { label: 'Restart and Install', variant: 'primary' },
+        { label: 'Later', variant: 'secondary' }
+      ],
+      width: 520,
+      height: 320
     });
-    if (result.response === 0) {
+    if (response === 0) {
       autoUpdater.quitAndInstall();
     }
   } finally {
@@ -557,13 +562,7 @@ function initializeLauncherUpdater() {
 
 async function checkForLauncherUpdates({ userInitiated = false } = {}) {
   if (!isLauncherUpdaterAvailable()) {
-    if (userInitiated) {
-      showInfoWindow(
-        'Launcher update unavailable',
-        'Auto-update is only available in the packaged installer build.'
-      );
-    }
-    return null;
+    return checkForGithubLauncherUpdates({ userInitiated });
   }
   if (state.launcherUpdate.downloadedVersion) {
     await showLauncherUpdateReadyPrompt({ version: state.launcherUpdate.downloadedVersion });
@@ -603,6 +602,299 @@ async function checkForLauncherUpdates({ userInitiated = false } = {}) {
   }
 }
 
+async function checkForGithubLauncherUpdates({ userInitiated = false } = {}) {
+  try {
+    const release = await fetchJson(GITHUB_LATEST_RELEASE_API, {
+      headers: {
+        'User-Agent': CONFIG.userAgent,
+        'Cache-Control': 'no-cache'
+      }
+    });
+    const latestVersion = normalizeVersionLabel(release.tag_name || release.name || '');
+    if (!latestVersion) throw new Error('Latest GitHub release did not include a version.');
+    if (compareVersionLabels(latestVersion, APP_VERSION) > 0) {
+      const response = await showLauncherPromptWindow({
+        title: 'Launcher Update Available',
+        heading: 'Launcher update available',
+        detail: `You are running launcher version ${APP_VERSION}. Version ${latestVersion} is available.\n\nDownload and launch the installer now?`,
+        buttons: [
+          { label: 'Install Update', variant: 'primary' },
+          { label: 'Open Releases Page', variant: 'secondary' },
+          { label: 'Later', variant: 'secondary' }
+        ],
+        width: 560,
+        height: 340
+      });
+      if (response === 0) {
+        await installGithubLauncherUpdate(release, latestVersion);
+      } else if (response === 1) {
+        await shell.openExternal(GITHUB_RELEASES_URL);
+      }
+      return { updateAvailable: true, version: latestVersion };
+    }
+    if (userInitiated) {
+      showInfoWindow(
+        'Launcher is up to date',
+        `You are running launcher version ${APP_VERSION}.`
+      );
+    }
+    return { updateAvailable: false, version: latestVersion };
+  } catch (error) {
+    if (userInitiated) {
+      showInfoWindow('Launcher update failed', error.message);
+    } else {
+      status(`Launcher update failed: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+function showLauncherPromptWindow({ title, heading, detail, buttons, width = 520, height = 320 }) {
+  return new Promise(resolve => {
+    const responseChannel = `launcher-prompt:${crypto.randomUUID()}`;
+    const backgroundUrl = assetDataUrl('assets', 'background', 'layout_background_blank.png');
+    const iconUrl = assetDataUrl('assets', 'logo', 'icon.png');
+    const buttonMarkup = buttons.map((button, index) => `
+      <button
+        class="${button.variant === 'primary' ? 'primary' : 'secondary'}"
+        data-index="${index}"
+        ${index === 0 ? 'autofocus' : ''}
+      >${escapeHtml(button.label)}</button>
+    `).join('');
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #eff5fb;
+      --muted: #b7c1cb;
+      --line: rgba(255, 255, 255, 0.15);
+      --panel: rgba(14, 18, 22, 0.92);
+      --accent: #67d29d;
+      --accent-2: #e4c45d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", Arial, sans-serif;
+      color: var(--ink);
+      background: #101417 url("${backgroundUrl}") center / cover fixed;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.84), rgba(5, 8, 10, 0.42));
+      pointer-events: none;
+    }
+    .shell {
+      position: relative;
+      z-index: 1;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .panel {
+      width: min(100%, 500px);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 18px 52px rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .panel-head img {
+      width: 34px;
+      height: 34px;
+      flex: 0 0 auto;
+    }
+    .eyebrow {
+      margin: 0 0 4px;
+      color: var(--accent-2);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      color: var(--accent);
+      letter-spacing: 0;
+    }
+    .content {
+      padding: 18px 20px 20px;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+      white-space: pre-wrap;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.08);
+    }
+    button.primary {
+      color: #07110b;
+      border-color: transparent;
+      background: var(--accent);
+      font-weight: 700;
+    }
+    button:hover {
+      border-color: rgba(255, 255, 255, 0.35);
+    }
+    button.primary:hover {
+      border-color: transparent;
+      filter: brightness(1.03);
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <main class="panel">
+      <div class="panel-head">
+        <img src="${iconUrl}" alt="">
+        <div>
+          <div class="eyebrow">Launcher</div>
+          <h1>${escapeHtml(heading)}</h1>
+        </div>
+      </div>
+      <div class="content">
+        <p>${escapeHtml(detail)}</p>
+        <div class="actions">${buttonMarkup}</div>
+      </div>
+    </main>
+  </div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const responseChannel = ${JSON.stringify(responseChannel)};
+    for (const button of document.querySelectorAll('[data-index]')) {
+      button.addEventListener('click', () => {
+        ipcRenderer.send(responseChannel, Number(button.dataset.index));
+        window.close();
+      });
+    }
+    window.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        const cancelIndex = ${Math.max(0, (buttons.length || 1) - 1)};
+        ipcRenderer.send(responseChannel, cancelIndex);
+        window.close();
+      }
+    });
+  </script>
+</body>
+</html>`;
+    const promptWindow = new BrowserWindow({
+      width,
+      height,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      parent: state.win,
+      modal: true,
+      title,
+      icon: assetPath('assets', 'logo', 'icon.ico'),
+      webPreferences: {
+        contextIsolation: false,
+        nodeIntegration: true
+      }
+    });
+    promptWindow.setMenuBarVisibility(false);
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      ipcMain.removeAllListeners(responseChannel);
+      resolve(value);
+    };
+    ipcMain.once(responseChannel, (_event, value) => finish(value));
+    promptWindow.on('closed', () => finish(Math.max(0, (buttons.length || 1) - 1)));
+    promptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  });
+}
+
+function assetDataUrl(...parts) {
+  const asset = assetPath(...parts);
+  const extension = path.extname(asset).toLowerCase();
+  const mimeType = extension === '.png'
+    ? 'image/png'
+    : extension === '.jpg' || extension === '.jpeg'
+      ? 'image/jpeg'
+      : extension === '.svg'
+        ? 'image/svg+xml'
+        : 'application/octet-stream';
+  return `data:${mimeType};base64,${fss.readFileSync(asset).toString('base64')}`;
+}
+
+function selectGithubInstallerAsset(release) {
+  const assets = Array.isArray(release?.assets) ? release.assets : [];
+  return assets.find(asset => {
+    const name = String(asset?.name || '').toLowerCase();
+    return name.endsWith('-setup.exe') && !name.endsWith('.blockmap');
+  }) || assets.find(asset => {
+    const name = String(asset?.name || '').toLowerCase();
+    return name.endsWith('.exe') && !name.endsWith('.blockmap');
+  }) || null;
+}
+
+async function installGithubLauncherUpdate(release, version) {
+  const asset = selectGithubInstallerAsset(release);
+  if (!asset?.browser_download_url || !asset?.name) {
+    throw new Error('Latest GitHub release does not include a Windows installer asset.');
+  }
+  const target = path.join(roots.metadata, 'updates', normalizeVersionLabel(version), asset.name);
+  status(`Downloading launcher update ${version}...`);
+  await download(asset.browser_download_url, target, {
+    'User-Agent': CONFIG.userAgent,
+    'Cache-Control': 'no-cache',
+    force: true
+  });
+  status(`Launching launcher update installer ${version}...`);
+  const launchError = await shell.openPath(target);
+  if (launchError) throw new Error(launchError);
+}
+
+function normalizeVersionLabel(value) {
+  return String(value || '').trim().replace(/^v/i, '');
+}
+
+function compareVersionLabels(left, right) {
+  const leftParts = normalizeVersionLabel(left).split('.').map(part => Number(part) || 0);
+  const rightParts = normalizeVersionLabel(right).split('.').map(part => Number(part) || 0);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index++) {
+    const difference = (leftParts[index] || 0) - (rightParts[index] || 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -624,11 +916,10 @@ function githubDefaultsRawUrl(remotePath) {
   return `https://raw.githubusercontent.com/MrZylr/Minescape-Addons-Client-Resources/main/${remotePath.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-function modrinthProjectRef(source) {
-  if (source.startsWith('modrinth:')) return source.slice('modrinth:'.length).trim();
-  const url = new URL(source);
-  const parts = url.pathname.split('/').filter(Boolean);
-  return ['mod', 'plugin', 'modpack', 'resourcepack', 'shader'].includes(parts[0]) ? parts[1] : parts[0];
+function modrinthProjectId(mod) {
+  const projectId = mod.projectId?.trim();
+  if (!projectId) throw new Error(`Missing Modrinth project ID for ${mod.id}.`);
+  return projectId;
 }
 
 async function syncMods(inst) {
@@ -668,7 +959,7 @@ async function syncMods(inst) {
 }
 
 async function resolveModrinthFile(mod, configuredOffset) {
-  const versions = await fetchJson(`https://api.modrinth.com/v2/project/${modrinthProjectRef(mod.source)}/version`, {
+  const versions = await fetchJson(`https://api.modrinth.com/v2/project/${modrinthProjectId(mod)}/version`, {
     headers: { 'User-Agent': CONFIG.userAgent }
   });
   const compatible = versions
