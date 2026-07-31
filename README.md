@@ -36,6 +36,6 @@ Each signed-in account gets its own instance folder under:
 
 ## Updates
 
-The launcher checks GitHub for a `launcher_version` file and compares it to the built-in launcher version. If they do not match, it shows an update notification with a link to the launcher page.
+The launcher checks GitHub launcher updates
 
 Config data has its own `version` file. If the local config data version does not match GitHub, the launcher disables Play and asks you to run **Prepare Client** so the latest files can be downloaded.
