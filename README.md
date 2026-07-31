@@ -13,10 +13,11 @@ The launcher signs in with your Minecraft account, prepares a local MineScape in
 
 ## Setup
 
-1. Download the latest portable launcher `.exe` from the GitHub releases page.
+1. Download the latest launcher `.exe` from the GitHub releases page.
 2. Run the launcher.("Windows protected your PC" may pop-up as this isnt downloaded frequently and is unsigned. Click "More Info" then "Run Anyway")
-3. Click **Sign in** and complete Microsoft/Minecraft authentication in your browser.
-4. Click **Prepare Client**. The launcher will download Minecraft runtime files, Fabric files, MineScape config data(from https://github.com/MrZylr/MineScape-Addons-Resource-Pack), and the required mods.
+3. Proceed through the installation steps
+4. Click **Sign in** and complete Microsoft/Minecraft authentication in your browser.
+5. Click **Prepare Client**. The launcher will download Minecraft runtime files, Fabric files, MineScape config data(from https://github.com/MrZylr/MineScape-Addons-Resource-Pack), and the required mods.
 
    (This may take a while)
 6. Click **Play** when the launcher says the client is ready.
