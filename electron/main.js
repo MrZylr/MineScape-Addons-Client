@@ -1,5 +1,4 @@
 const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron');
-const { autoUpdater } = require('electron-updater');
 const crypto = require('crypto');
 const fs = require('fs/promises');
 const fss = require('fs');
@@ -39,6 +38,9 @@ const state = {
   sessions: [],
   activeUsername: '',
   login: null,
+  consoleWindow: null,
+  consoleTargetInstance: '',
+  activeClients: new Map(),
   prepareInProgress: false,
   javaOverridePath: '',
   launchPreferences: {
@@ -50,8 +52,12 @@ const state = {
     manualCheckInProgress: false,
     downloadInProgress: false,
     availableVersion: '',
+    availableRelease: null,
     downloadedVersion: '',
-    promptVisible: false
+    downloadedInstallerPath: '',
+    promptVisible: false,
+    lastCheckSummary: '',
+    lastError: ''
   },
   defaultResources: {
     checked: false,
@@ -62,9 +68,7 @@ const state = {
 };
 
 function assetPath(...parts) {
-  return app.isPackaged
-    ? path.join(process.resourcesPath, ...parts)
-    : path.join(__dirname, ...parts);
+  return path.join(__dirname, ...parts);
 }
 
 function instanceDirectory() {
@@ -358,6 +362,8 @@ const bundledMods = [
   ['Fancy Menu', 'Wq5SjeWM', 0],
   ['Konkrete', 'J81TRJWm', 0],
   ['MCEF', 'bQhBuv7x', 0],
+  ['Multimedia API', 'G922NeHS', 0],
+  ['Multimedia Binaries', '4997XcoK', 0],
   ['Melody', 'CVT4pFB2', 0],
   ['Prickle', 'aaRl8GiW', 0],
   ['Xaeros Minimap', '1bokaNcj', 0],
@@ -455,15 +461,28 @@ function isLauncherUpdaterAvailable() {
   return app.isPackaged;
 }
 
+function setLauncherUpdateSummary(message) {
+  state.launcherUpdate.lastCheckSummary = message || '';
+  status(message);
+}
+
+function setLauncherUpdateError(message) {
+  state.launcherUpdate.lastError = message || '';
+  if (message) {
+    status(`Launcher update failed: ${message}`);
+  }
+}
+
 async function showLauncherUpdateAvailablePrompt(info) {
   if (state.launcherUpdate.promptVisible) return;
   state.launcherUpdate.promptVisible = true;
   try {
     const version = info?.version || state.launcherUpdate.availableVersion || 'unknown';
+    const release = info?.release || state.launcherUpdate.availableRelease;
     const response = await showLauncherPromptWindow({
       title: 'Launcher Update Available',
       heading: 'Launcher update available',
-      detail: `You are running launcher version ${APP_VERSION}. Version ${version} is available.\n\nDownload and prepare the update now?`,
+      detail: `You are running launcher version ${APP_VERSION}. Version ${version} is available.\n\nDownload the update installer now?`,
       buttons: [
         { label: 'Download Update', variant: 'primary' },
         { label: 'Later', variant: 'secondary' }
@@ -472,11 +491,14 @@ async function showLauncherUpdateAvailablePrompt(info) {
       height: 320
     });
     if (response === 0) {
-      status(`Downloading launcher update ${version}...`);
-      await autoUpdater.downloadUpdate();
+      await downloadGithubLauncherUpdate(release, version);
+      await showLauncherUpdateReadyPrompt({ version });
     }
   } catch (error) {
-    status(`Launcher update failed: ${error.message}`);
+    setLauncherUpdateError(error.message);
+    if (state.launcherUpdate.manualCheckInProgress) {
+      showInfoWindow('Launcher update failed', buildLauncherUpdateDiagnostics(error.message));
+    }
   } finally {
     state.launcherUpdate.promptVisible = false;
     state.launcherUpdate.manualCheckInProgress = false;
@@ -491,16 +513,22 @@ async function showLauncherUpdateReadyPrompt(info) {
     const response = await showLauncherPromptWindow({
       title: 'Launcher Update Ready',
       heading: 'Launcher update downloaded',
-      detail: `Version ${version} has been downloaded.\n\nRestart the launcher now to install it?`,
+      detail: `Version ${version} has been downloaded.\n\nClose the launcher and run the installer now?`,
       buttons: [
-        { label: 'Restart and Install', variant: 'primary' },
+        { label: 'Install Update', variant: 'primary' },
         { label: 'Later', variant: 'secondary' }
       ],
       width: 520,
       height: 320
     });
     if (response === 0) {
-      autoUpdater.quitAndInstall();
+      await launchDownloadedLauncherUpdate(version);
+      app.quit();
+    }
+  } catch (error) {
+    setLauncherUpdateError(error.message);
+    if (state.launcherUpdate.manualCheckInProgress) {
+      showInfoWindow('Launcher update failed', buildLauncherUpdateDiagnostics(error.message));
     }
   } finally {
     state.launcherUpdate.promptVisible = false;
@@ -508,61 +536,18 @@ async function showLauncherUpdateReadyPrompt(info) {
 }
 
 function initializeLauncherUpdater() {
-  if (!isLauncherUpdaterAvailable()) return;
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = false;
-
-  autoUpdater.on('checking-for-update', () => {
-    state.launcherUpdate.checkInProgress = true;
-    status('Checking for launcher update...');
-  });
-
-  autoUpdater.on('update-available', async info => {
-    state.launcherUpdate.checkInProgress = false;
-    state.launcherUpdate.availableVersion = info?.version || '';
-    await showLauncherUpdateAvailablePrompt(info);
-  });
-
-  autoUpdater.on('update-not-available', () => {
-    state.launcherUpdate.checkInProgress = false;
-    state.launcherUpdate.availableVersion = '';
-    if (state.launcherUpdate.manualCheckInProgress) {
-      showInfoWindow(
-        'Launcher is up to date',
-        `You are running launcher version ${APP_VERSION}.`
-      );
-    }
-    state.launcherUpdate.manualCheckInProgress = false;
-  });
-
-  autoUpdater.on('download-progress', progress => {
-    state.launcherUpdate.downloadInProgress = true;
-    const version = state.launcherUpdate.availableVersion ? ` ${state.launcherUpdate.availableVersion}` : '';
-    status(`Downloading launcher update${version}... ${Math.round(progress.percent)}%`);
-  });
-
-  autoUpdater.on('update-downloaded', async info => {
-    state.launcherUpdate.downloadInProgress = false;
-    state.launcherUpdate.downloadedVersion = info?.version || state.launcherUpdate.availableVersion || '';
-    status(`Launcher update ${state.launcherUpdate.downloadedVersion || ''} is ready to install.`);
-    await showLauncherUpdateReadyPrompt(info);
-  });
-
-  autoUpdater.on('error', error => {
-    state.launcherUpdate.checkInProgress = false;
-    state.launcherUpdate.downloadInProgress = false;
-    const message = error?.message || String(error);
-    status(`Launcher update failed: ${message}`);
-    if (state.launcherUpdate.manualCheckInProgress) {
-      showInfoWindow('Launcher update failed', message);
-    }
-    state.launcherUpdate.manualCheckInProgress = false;
-  });
+  return;
 }
 
 async function checkForLauncherUpdates({ userInitiated = false } = {}) {
   if (!isLauncherUpdaterAvailable()) {
-    return checkForGithubLauncherUpdates({ userInitiated });
+    if (userInitiated) {
+      showInfoWindow(
+        'Launcher updates unavailable',
+        `This build is not packaged, so launcher updates are disabled.\n\nVersion: ${APP_VERSION}`
+      );
+    }
+    return null;
   }
   if (state.launcherUpdate.downloadedVersion) {
     await showLauncherUpdateReadyPrompt({ version: state.launcherUpdate.downloadedVersion });
@@ -589,20 +574,22 @@ async function checkForLauncherUpdates({ userInitiated = false } = {}) {
   }
   state.launcherUpdate.manualCheckInProgress = userInitiated;
   try {
-    return await autoUpdater.checkForUpdates();
+    return await checkForGithubLauncherUpdates({ userInitiated, autoDownload: true });
   } catch (error) {
     state.launcherUpdate.checkInProgress = false;
     state.launcherUpdate.manualCheckInProgress = false;
+    setLauncherUpdateError(error.message);
     if (userInitiated) {
-      showInfoWindow('Launcher update failed', error.message);
-    } else {
-      status(`Launcher update failed: ${error.message}`);
+      showInfoWindow('Launcher update failed', buildLauncherUpdateDiagnostics(error.message));
     }
     return null;
   }
 }
 
-async function checkForGithubLauncherUpdates({ userInitiated = false } = {}) {
+async function checkForGithubLauncherUpdates({ userInitiated = false, autoDownload = false } = {}) {
+  state.launcherUpdate.checkInProgress = true;
+  state.launcherUpdate.lastError = '';
+  setLauncherUpdateSummary(`Checking for launcher update from ${GITHUB_LATEST_RELEASE_API}...`);
   try {
     const release = await fetchJson(GITHUB_LATEST_RELEASE_API, {
       headers: {
@@ -610,42 +597,48 @@ async function checkForGithubLauncherUpdates({ userInitiated = false } = {}) {
         'Cache-Control': 'no-cache'
       }
     });
+    setLauncherUpdateSummary(`Fetched latest GitHub release metadata. Tag: ${release.tag_name || 'missing'}, Name: ${release.name || 'missing'}.`);
     const latestVersion = normalizeVersionLabel(release.tag_name || release.name || '');
     if (!latestVersion) throw new Error('Latest GitHub release did not include a version.');
+    state.launcherUpdate.availableVersion = latestVersion;
+    state.launcherUpdate.availableRelease = release;
+    setLauncherUpdateSummary(`Installed launcher version ${APP_VERSION}. Latest GitHub version ${latestVersion}.`);
     if (compareVersionLabels(latestVersion, APP_VERSION) > 0) {
-      const response = await showLauncherPromptWindow({
-        title: 'Launcher Update Available',
-        heading: 'Launcher update available',
-        detail: `You are running launcher version ${APP_VERSION}. Version ${latestVersion} is available.\n\nDownload and launch the installer now?`,
-        buttons: [
-          { label: 'Install Update', variant: 'primary' },
-          { label: 'Open Releases Page', variant: 'secondary' },
-          { label: 'Later', variant: 'secondary' }
-        ],
-        width: 560,
-        height: 340
-      });
-      if (response === 0) {
-        await installGithubLauncherUpdate(release, latestVersion);
-      } else if (response === 1) {
-        await shell.openExternal(GITHUB_RELEASES_URL);
+      if (state.launcherUpdate.downloadedVersion === latestVersion) {
+        setLauncherUpdateSummary(`Launcher update ${latestVersion} is already downloaded.`);
+        await showLauncherUpdateReadyPrompt({ version: latestVersion });
+        return { updateAvailable: true, version: latestVersion, downloaded: true };
+      }
+      if (autoDownload) {
+        setLauncherUpdateSummary(`Update ${latestVersion} is newer than ${APP_VERSION}. Starting installer download.`);
+        await downloadGithubLauncherUpdate(release, latestVersion);
+        await showLauncherUpdateReadyPrompt({ version: latestVersion });
+      } else {
+        await showLauncherUpdateAvailablePrompt({ version: latestVersion, release });
       }
       return { updateAvailable: true, version: latestVersion };
     }
+    state.launcherUpdate.availableVersion = '';
+    state.launcherUpdate.availableRelease = null;
+    setLauncherUpdateSummary(`Launcher is up to date. Installed ${APP_VERSION}, latest ${latestVersion}.`);
     if (userInitiated) {
       showInfoWindow(
         'Launcher is up to date',
-        `You are running launcher version ${APP_VERSION}.`
+        buildLauncherUpdateDiagnostics(`No update available. Installed ${APP_VERSION}, latest ${latestVersion}.`)
       );
     }
     return { updateAvailable: false, version: latestVersion };
   } catch (error) {
+    state.launcherUpdate.availableVersion = '';
+    state.launcherUpdate.availableRelease = null;
+    setLauncherUpdateError(error.message);
     if (userInitiated) {
-      showInfoWindow('Launcher update failed', error.message);
-    } else {
-      status(`Launcher update failed: ${error.message}`);
+      showInfoWindow('Launcher update failed', buildLauncherUpdateDiagnostics(error.message));
     }
     return null;
+  } finally {
+    state.launcherUpdate.checkInProgress = false;
+    state.launcherUpdate.manualCheckInProgress = false;
   }
 }
 
@@ -863,19 +856,57 @@ function selectGithubInstallerAsset(release) {
   }) || null;
 }
 
-async function installGithubLauncherUpdate(release, version) {
+function launcherUpdateTarget(version, assetName) {
+  return path.join(roots.metadata, 'updates', normalizeVersionLabel(version), assetName);
+}
+
+function buildLauncherUpdateDiagnostics(reason) {
+  const releaseAssets = Array.isArray(state.launcherUpdate.availableRelease?.assets)
+    ? state.launcherUpdate.availableRelease.assets.map(asset => asset.name).join('\n')
+    : 'none loaded';
+  return [
+    `Reason: ${reason || 'unknown'}`,
+    `Installed version: ${APP_VERSION}`,
+    `Available version: ${state.launcherUpdate.availableVersion || 'none'}`,
+    `Packaged build: ${app.isPackaged ? 'yes' : 'no'}`,
+    `Downloaded version: ${state.launcherUpdate.downloadedVersion || 'none'}`,
+    `Downloaded installer: ${state.launcherUpdate.downloadedInstallerPath || 'none'}`,
+    `Last step: ${state.launcherUpdate.lastCheckSummary || 'none'}`,
+    `Latest release assets:`,
+    releaseAssets
+  ].join('\n');
+}
+
+async function downloadGithubLauncherUpdate(release, version) {
   const asset = selectGithubInstallerAsset(release);
   if (!asset?.browser_download_url || !asset?.name) {
     throw new Error('Latest GitHub release does not include a Windows installer asset.');
   }
-  const target = path.join(roots.metadata, 'updates', normalizeVersionLabel(version), asset.name);
-  status(`Downloading launcher update ${version}...`);
+  const target = launcherUpdateTarget(version, asset.name);
+  state.launcherUpdate.downloadInProgress = true;
+  setLauncherUpdateSummary(`Downloading launcher update ${version} from ${asset.browser_download_url}...`);
   await download(asset.browser_download_url, target, {
     'User-Agent': CONFIG.userAgent,
     'Cache-Control': 'no-cache',
     force: true
   });
-  status(`Launching launcher update installer ${version}...`);
+  state.launcherUpdate.downloadInProgress = false;
+  state.launcherUpdate.downloadedVersion = version;
+  state.launcherUpdate.downloadedInstallerPath = target;
+  setLauncherUpdateSummary(`Launcher update ${version} downloaded to ${target}.`);
+  return target;
+}
+
+async function launchDownloadedLauncherUpdate(version) {
+  const updateDir = path.join(roots.metadata, 'updates', normalizeVersionLabel(version));
+  const entries = await fs.readdir(updateDir, { withFileTypes: true });
+  const installer = entries.find(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.exe') && !entry.name.toLowerCase().endsWith('.blockmap'));
+  if (!installer) {
+    throw new Error(`Downloaded launcher installer for version ${version} was not found.`);
+  }
+  const target = path.join(updateDir, installer.name);
+  state.launcherUpdate.downloadedInstallerPath = target;
+  setLauncherUpdateSummary(`Launching launcher update installer ${version} from ${target}...`);
   const launchError = await shell.openPath(target);
   if (launchError) throw new Error(launchError);
 }
@@ -904,12 +935,82 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replaceAll('&amp;', '&')
+    .replaceAll('&#x27;', "'")
+    .replaceAll('&#39;', "'")
+    .replaceAll('&quot;', '"')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&#96;', '`');
+}
+
 async function readTextIfExists(target) {
   try {
     return await fs.readFile(target, 'utf8');
   } catch {
     return '';
   }
+}
+
+function getActiveClient(inst) {
+  return state.activeClients.get(inst) || null;
+}
+
+function trimConsoleBuffer(value, maxChars = 500000) {
+  if (!value) return '';
+  return value.length > maxChars ? value.slice(value.length - maxChars) : value;
+}
+
+function sendConsoleEvent(channel, payload) {
+  if (!state.consoleWindow || state.consoleWindow.isDestroyed()) return;
+  state.consoleWindow.webContents.send(channel, payload);
+}
+
+function appendConsoleOutput(inst, chunk) {
+  const client = getActiveClient(inst);
+  if (!client || !chunk) return;
+  client.buffer = trimConsoleBuffer(`${client.buffer || ''}${chunk}`);
+  if (state.consoleTargetInstance === inst) {
+    sendConsoleEvent('console:append', { chunk, running: client.running });
+  }
+}
+
+async function readConsoleLogTail(logPath, maxBytes = 262144) {
+  try {
+    const handle = await fs.open(logPath, 'r');
+    try {
+      const stats = await handle.stat();
+      const length = Math.min(stats.size, maxBytes);
+      if (length <= 0) return '';
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, stats.size - length);
+      return buffer.toString('utf8');
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return '';
+  }
+}
+
+async function getConsoleSnapshot(inst) {
+  const client = getActiveClient(inst);
+  if (client) {
+    return {
+      content: client.buffer || '',
+      running: Boolean(client.running),
+      message: client.running ? 'Client running' : 'Client stopped'
+    };
+  }
+  const logPath = path.join(inst, 'logs', 'latest-client.log');
+  if (!(await exists(logPath))) return null;
+  return {
+    content: await readConsoleLogTail(logPath),
+    running: await isRunning(inst),
+    message: ''
+  };
 }
 
 function githubDefaultsRawUrl(remotePath) {
@@ -1422,7 +1523,7 @@ async function launchMinecraft() {
     ...tokenizeLaunchArgs(state.launchPreferences.extraJvmArgs || '')
   ], state.launchPreferences.maxMemoryMb);
   const gameArgs = [...collectArgs(versionRoot.arguments?.game, vars), ...collectArgs(fabricRoot.game, vars)];
-  const javaExe = resolveJavaExecutable();
+  const javaExe = resolveJavaExecutable({ preferConsoleOutput: true });
   const mainClass = fabricRoot.mainClass || versionRoot.mainClass;
   await mkdir(path.join(inst, 'logs'));
   await mkdir(path.join(inst, 'metadata'));
@@ -1430,17 +1531,51 @@ async function launchMinecraft() {
   const log = fss.openSync(logPath, 'a');
   const child = spawn(javaExe, [...jvmArgs, mainClass, ...gameArgs], {
     cwd: inst,
-    stdio: ['ignore', log, log],
+    stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    detached: true
+    detached: false
+  });
+  const clientState = {
+    child,
+    log,
+    logPath,
+    buffer: await readConsoleLogTail(logPath),
+    running: true,
+    pid: child.pid
+  };
+  state.activeClients.set(inst, clientState);
+  if (state.consoleTargetInstance === inst && clientState.buffer) {
+    sendConsoleEvent('console:replace', { content: clientState.buffer, running: true });
+  }
+  child.stdout?.on('data', chunk => {
+    const text = chunk.toString('utf8');
+    fss.writeSync(log, chunk);
+    appendConsoleOutput(inst, text);
+  });
+  child.stderr?.on('data', chunk => {
+    const text = chunk.toString('utf8');
+    fss.writeSync(log, chunk);
+    appendConsoleOutput(inst, text);
   });
   await fs.writeFile(path.join(inst, 'metadata', 'active-client.pid'), String(child.pid));
   child.once('error', async error => {
+    clientState.running = false;
+    state.activeClients.delete(inst);
+    try { fss.closeSync(log); } catch {}
     await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
+    if (state.consoleTargetInstance === inst) {
+      sendConsoleEvent('console:status', { running: false, message: `Minecraft process start failed: ${error.message}` });
+    }
     status(`Minecraft process start failed: ${error.message}`);
   });
   child.once('exit', async code => {
+    clientState.running = false;
+    state.activeClients.delete(inst);
+    try { fss.closeSync(log); } catch {}
     await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
+    if (state.consoleTargetInstance === inst) {
+      sendConsoleEvent('console:status', { running: false, message: code !== 0 ? `Minecraft exited with code ${code}.` : 'Minecraft client closed.' });
+    }
     if (code !== 0) {
       const logSummary = await readLaunchFailureSummary(logPath);
       status(logSummary
@@ -1451,16 +1586,24 @@ async function launchMinecraft() {
     }
     send('accounts', await publicState());
   });
-  child.unref();
   return `Minecraft launch started. Output is being written to ${logPath}.`;
 }
 
-function resolveJavaExecutable() {
+function resolveJavaExecutable(options = {}) {
+  const preferConsoleOutput = Boolean(options.preferConsoleOutput);
   const preferred = candidateJavaBinaries();
   for (const candidate of preferred) {
-    if (looksExecutable(candidate)) return candidate;
+    if (!looksExecutable(candidate)) continue;
+    if (preferConsoleOutput) {
+      const consoleCandidate = convertJavawToJava(candidate);
+      if (looksExecutable(consoleCandidate)) return consoleCandidate;
+    }
+    return candidate;
   }
-  return process.platform === 'win32' ? 'javaw' : 'java';
+  if (process.platform === 'win32') {
+    return preferConsoleOutput ? 'java' : 'javaw';
+  }
+  return 'java';
 }
 
 function candidateJavaBinaries() {
@@ -1470,6 +1613,15 @@ function candidateJavaBinaries() {
     path.join(javaHome, 'bin', 'javaw.exe'),
     path.join(javaHome, 'bin', 'java.exe')
   ].filter(Boolean);
+}
+
+function convertJavawToJava(candidate) {
+  if (!candidate) return candidate;
+  if (candidate.toLowerCase() === 'javaw') return 'java';
+  if (candidate.toLowerCase().endsWith('javaw.exe')) {
+    return `${candidate.slice(0, -'javaw.exe'.length)}java.exe`;
+  }
+  return candidate;
 }
 
 function looksExecutable(candidate) {
@@ -1704,6 +1856,326 @@ function isWindowsMinecraftProcess(pid, inst) {
     && commandLine.includes(normalizedInstance);
 }
 
+async function openActiveProfileConsole() {
+  const inst = instanceDirectory();
+  const running = await isRunning(inst);
+  if (!running) {
+    showInfoWindow('Console unavailable', 'The active profile does not currently have a launched Minecraft client.');
+    return;
+  }
+  const logPath = path.join(inst, 'logs', 'latest-client.log');
+  if (!(await exists(logPath))) {
+    showInfoWindow('Console unavailable', `Minecraft is running, but the console log was not found yet.\n\nExpected log:\n${logPath}`);
+    return;
+  }
+  state.consoleTargetInstance = inst;
+  const profileName = state.activeUsername || activeSession()?.username || 'Active Profile';
+  const backgroundUrl = assetDataUrl('assets', 'background', 'layout_background_blank.png');
+  const iconUrl = assetDataUrl('assets', 'logo', 'icon.png');
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minecraft Console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #eff5fb;
+      --muted: #9fb0bf;
+      --line: rgba(255, 255, 255, 0.14);
+      --panel: rgba(14, 18, 22, 0.90);
+      --accent: #67d29d;
+      --accent-2: #e4c45d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", Arial, sans-serif;
+      color: var(--ink);
+      background: #101417 url("${backgroundUrl}") center / cover fixed;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: linear-gradient(90deg, rgba(5, 8, 10, 0.88), rgba(5, 8, 10, 0.56));
+      pointer-events: none;
+    }
+    .shell {
+      position: relative;
+      z-index: 1;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 22px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(12, 16, 20, 0.72);
+      backdrop-filter: blur(8px);
+    }
+    .title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .title-wrap img {
+      width: 36px;
+      height: 36px;
+      flex: 0 0 auto;
+    }
+    .eyebrow {
+      margin: 0 0 4px;
+      color: var(--accent-2);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      color: var(--accent);
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.08);
+    }
+    button.primary {
+      color: #07110b;
+      border-color: transparent;
+      background: var(--accent);
+      font-weight: 700;
+    }
+    main {
+      padding: 20px 22px 22px;
+      min-height: 0;
+    }
+    .console-shell {
+      height: calc(100vh - 104px);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 18px 52px rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .console-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .console-meta strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+    pre {
+      margin: 0;
+      padding: 16px;
+      min-height: 0;
+      overflow: auto;
+      background: rgba(9, 12, 15, 0.96);
+      color: #d7e3ec;
+      font: 12px/1.55 Consolas, "Cascadia Mono", "Courier New", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .state-live { color: var(--accent); }
+    .state-stopped { color: var(--accent-2); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="title-wrap">
+        <img src="${iconUrl}" alt="">
+        <div>
+          <div class="eyebrow">Launcher Console</div>
+          <h1>Minecraft Console</h1>
+          <div class="subtitle">${escapeHtml(profileName)}</div>
+        </div>
+      </div>
+      <div class="actions">
+        <label class="toggle"><input id="follow-toggle" type="checkbox" checked> Follow output</label>
+        <button id="refresh-button">Refresh</button>
+        <button class="primary" id="close-button">Close</button>
+      </div>
+    </header>
+    <main>
+      <section class="console-shell">
+        <div class="console-meta">
+          <div><strong>Log File</strong> <span id="log-path"></span></div>
+          <div id="run-state" class="state-live">Client running</div>
+        </div>
+        <pre id="console-output">Loading console output...</pre>
+      </section>
+    </main>
+  </div>
+  <script>
+    const fs = require('fs/promises');
+    const { ipcRenderer } = require('electron');
+    const logPath = ${JSON.stringify(logPath)};
+    const pidPath = ${JSON.stringify(path.join(inst, 'metadata', 'active-client.pid'))};
+    const instanceKey = ${JSON.stringify(inst)};
+    const output = document.getElementById('console-output');
+    const runState = document.getElementById('run-state');
+    const followToggle = document.getElementById('follow-toggle');
+    const logPathEl = document.getElementById('log-path');
+    let lastContent = '';
+
+    logPathEl.textContent = logPath;
+
+    async function fileExists(target) {
+      try {
+        await fs.access(target);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function applyRunningState(running, message) {
+      runState.textContent = running ? 'Client running' : (message || 'Client stopped');
+      runState.className = running ? 'state-live' : 'state-stopped';
+    }
+
+    function applyContent(content, mode) {
+      const wasAtBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
+      if (mode === 'append') {
+        output.textContent += content;
+      } else {
+        output.textContent = content || 'Console log is empty.';
+      }
+      lastContent = output.textContent;
+      if (followToggle.checked || wasAtBottom || mode !== 'append') {
+        output.scrollTop = output.scrollHeight;
+      }
+    }
+
+    async function updateFromFile() {
+      try {
+        const content = await fs.readFile(logPath, 'utf8');
+        const normalized = content || 'Console log is empty.';
+        if (normalized !== lastContent) {
+          applyContent(normalized, 'replace');
+        }
+      } catch (error) {
+        const message = error && error.code === 'ENOENT'
+          ? 'Console log is not available yet.'
+          : 'Failed to read console log: ' + (error && error.message ? error.message : String(error));
+        if (message !== lastContent) {
+          applyContent(message, 'replace');
+        }
+      }
+      const running = await fileExists(pidPath);
+      applyRunningState(running);
+    }
+
+    ipcRenderer.on('console:replace', (_event, payload) => {
+      if (!payload) return;
+      applyContent(payload.content || '', 'replace');
+      applyRunningState(Boolean(payload.running), payload.message || '');
+    });
+
+    ipcRenderer.on('console:append', (_event, payload) => {
+      if (!payload || typeof payload.chunk !== 'string') return;
+      applyContent(payload.chunk, 'append');
+      applyRunningState(Boolean(payload.running), payload.message || '');
+    });
+
+    ipcRenderer.on('console:status', (_event, payload) => {
+      if (!payload) return;
+      applyRunningState(Boolean(payload.running), payload.message || '');
+    });
+
+    async function refreshOutput() {
+      const snapshot = await ipcRenderer.invoke('console:state', instanceKey);
+      if (snapshot && typeof snapshot.content === 'string') {
+        applyContent(snapshot.content, 'replace');
+        applyRunningState(Boolean(snapshot.running), snapshot.message || '');
+        return;
+      }
+      await updateFromFile();
+    }
+
+    async function initialize() {
+      await refreshOutput();
+    }
+
+    document.getElementById('refresh-button').addEventListener('click', () => {
+      refreshOutput();
+    });
+    document.getElementById('close-button').addEventListener('click', () => window.close());
+
+    initialize();
+  </script>
+</body>
+</html>`;
+
+  if (state.consoleWindow && !state.consoleWindow.isDestroyed()) {
+    state.consoleWindow.close();
+  }
+
+  state.consoleWindow = new BrowserWindow({
+    width: 1120,
+    height: 760,
+    minWidth: 860,
+    minHeight: 560,
+    title: `Minecraft Console - ${profileName}`,
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    parent: state.win,
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true
+    }
+  });
+  state.consoleWindow.on('closed', () => {
+    state.consoleWindow = null;
+    if (state.consoleTargetInstance === inst) state.consoleTargetInstance = '';
+  });
+  state.consoleWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  state.consoleWindow.focus();
+}
+
 async function beginLogin() {
   if (!CONFIG.minecraftAuthApproved) throw new Error('Minecraft account launch is blocked until this app registration is approved.');
   const stateToken = crypto.randomBytes(24).toString('base64url');
@@ -1826,14 +2298,38 @@ function callbackPage(success) {
 async function fetchBlog() {
   try {
     const html = await fetchText('https://minescape.com/blog/', { headers: { 'User-Agent': CONFIG.userAgent } });
-    const posts = [...html.matchAll(/<li><a href="([^"]+)">([^<]+)<\/a><\/li>/g)].slice(0, 6).map(match => ({
-      url: new URL(match[1], 'https://minescape.com').toString(),
-      title: match[2].replaceAll('&amp;', '&').replaceAll('&#x27;', "'").replaceAll('&quot;', '"'),
-      imageUrl: ''
-    }));
+    const posts = [];
+    const seen = new Set();
+    const cardPattern = /<a[^>]+class="absolute inset-0 z-10"[^>]+href="([^"]+)"[^>]*>\s*<span[^>]*class="sr-only"[^>]*>([^<]+)<\/span>\s*<\/a>[\s\S]*?<img[^>]+src="([^"]+)"/gi;
+    for (const match of html.matchAll(cardPattern)) {
+      const url = new URL(match[1], 'https://minescape.com').toString();
+      if (seen.has(url)) continue;
+      seen.add(url);
+      posts.push({
+        url,
+        title: decodeHtmlEntities(match[2]),
+        imageUrl: new URL(match[3], 'https://minescape.com').toString()
+      });
+      if (posts.length >= 6) break;
+    }
+
+    if (posts.length === 0) {
+      for (const match of html.matchAll(/<li><a href="([^"]+)">([^<]+)<\/a><\/li>/g)) {
+        const url = new URL(match[1], 'https://minescape.com').toString();
+        if (seen.has(url)) continue;
+        seen.add(url);
+        posts.push({
+          url,
+          title: decodeHtmlEntities(match[2]),
+          imageUrl: ''
+        });
+        if (posts.length >= 6) break;
+      }
+    }
+
     return Promise.all(posts.map(async post => ({
       ...post,
-      imageUrl: await resolveBlogImage(post.url)
+      imageUrl: post.imageUrl || await resolveBlogImage(post.url)
     })));
   } catch {
     return [];
@@ -1923,6 +2419,12 @@ function buildApplicationMenu() {
           label: 'Adjust Launch Args',
           click: async () => {
             await openLaunchArgsWindow();
+          }
+        },
+        {
+          label: 'Console',
+          click: async () => {
+            await openActiveProfileConsole();
           }
         },
         { type: 'separator' },
@@ -2636,6 +3138,7 @@ function escapeHtmlAttribute(value) {
 
 ipcMain.handle('app:state', publicState);
 ipcMain.handle('app:blog', fetchBlog);
+ipcMain.handle('console:state', async (_event, inst) => getConsoleSnapshot(inst));
 ipcMain.handle('auth:login', beginLogin);
 ipcMain.handle('auth:logout', async () => {
   state.sessions = state.sessions.filter(s => s.username !== state.activeUsername);
@@ -2739,6 +3242,10 @@ function isFirstRunPrepareReason(reason) {
   ].includes(reason);
 }
 app.on('window-all-closed', () => {
+  for (const client of state.activeClients.values()) {
+    try { fss.closeSync(client.log); } catch {}
+  }
+  state.activeClients.clear();
   state.login?.server?.close();
   if (process.platform !== 'darwin') app.quit();
 });
