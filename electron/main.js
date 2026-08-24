@@ -38,6 +38,7 @@ const state = {
   sessions: [],
   activeUsername: '',
   login: null,
+  loginWindow: null,
   consoleWindow: null,
   consoleTargetInstance: '',
   activeClients: new Map(),
@@ -2178,11 +2179,17 @@ async function openActiveProfileConsole() {
 
 async function beginLogin() {
   if (!CONFIG.minecraftAuthApproved) throw new Error('Minecraft account launch is blocked until this app registration is approved.');
+  if (state.login) {
+    if (state.loginWindow && !state.loginWindow.isDestroyed()) state.loginWindow.focus();
+    return { ok: true, message: 'Microsoft sign-in is already open.' };
+  }
   const stateToken = crypto.randomBytes(24).toString('base64url');
   const verifier = crypto.randomBytes(64).toString('base64url');
   const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
   const server = http.createServer();
+  let rejectLogin;
   const done = new Promise((resolve, reject) => {
+    rejectLogin = reject;
     server.on('request', (req, res) => {
       const url = new URL(req.url, `http://localhost:${server.address().port}`);
       if (url.searchParams.get('state') !== stateToken) {
@@ -2204,10 +2211,47 @@ async function beginLogin() {
     scope: CONFIG.microsoftScope,
     code_challenge: challenge,
     code_challenge_method: 'S256',
+    prompt: 'select_account',
     state: stateToken
   })}`;
-  state.login = { server, done, redirect, verifier };
-  await shell.openExternal(authUrl);
+  const authWindow = new BrowserWindow({
+    width: 520,
+    height: 720,
+    minWidth: 420,
+    minHeight: 640,
+    title: 'Microsoft Sign In',
+    icon: assetPath('assets', 'logo', 'icon.ico'),
+    parent: state.win,
+    modal: true,
+    minimizable: false,
+    maximizable: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  authWindow.setMenuBarVisibility(false);
+  state.login = { server, done, redirect, verifier, rejectLogin, completed: false };
+  state.loginWindow = authWindow;
+
+  authWindow.on('closed', () => {
+    if (!state.login || state.login.completed) return;
+    state.login.completed = true;
+    state.login.server.close();
+    state.login.rejectLogin(new Error('Microsoft sign-in was closed before completion.'));
+    state.login = null;
+    state.loginWindow = null;
+  });
+  authWindow.webContents.on('did-navigate', (_event, navigatedUrl) => {
+    if (!state.login || !navigatedUrl.startsWith(redirect)) return;
+    state.login.completed = true;
+    if (state.loginWindow && !state.loginWindow.isDestroyed()) {
+      state.loginWindow.close();
+    }
+  });
+
+  await authWindow.loadURL(authUrl);
   done.then(async code => {
     server.close();
     const token = await fetchJson(`https://login.microsoftonline.com/${CONFIG.microsoftTenant}/oauth2/v2.0/token`, {
@@ -2227,8 +2271,14 @@ async function beginLogin() {
     await checkDefaultResourceVersion(instanceDirectory());
     send('accounts', await publicState());
     status(`Minecraft profile resolved for ${resolved.username}.`);
-  }).catch(err => status(`Microsoft sign-in failed: ${err.message}`));
-  return { ok: true, url: authUrl, message: 'Microsoft sign-in opened in your browser.' };
+  }).catch(err => status(`Microsoft sign-in failed: ${err.message}`))
+    .finally(() => {
+      server.close();
+      if (state.loginWindow && !state.loginWindow.isDestroyed()) state.loginWindow.close();
+      state.loginWindow = null;
+      state.login = null;
+    });
+  return { ok: true, url: authUrl, message: 'Microsoft sign-in opened in the launcher.' };
 }
 
 function callbackPage(success) {
