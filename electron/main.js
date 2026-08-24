@@ -959,6 +959,14 @@ function getActiveClient(inst) {
   return state.activeClients.get(inst) || null;
 }
 
+function activeClientPidPath(inst) {
+  return path.join(inst, 'metadata', 'active-client.pid');
+}
+
+function activeClientMetaPath(inst) {
+  return path.join(inst, 'metadata', 'active-client.json');
+}
+
 function trimConsoleBuffer(value, maxChars = 500000) {
   if (!value) return '';
   return value.length > maxChars ? value.slice(value.length - maxChars) : value;
@@ -976,6 +984,20 @@ function appendConsoleOutput(inst, chunk) {
   if (state.consoleTargetInstance === inst) {
     sendConsoleEvent('console:append', { chunk, running: client.running });
   }
+}
+
+function preferredConsoleLogPaths(inst) {
+  return [
+    path.join(inst, 'logs', 'latest.log'),
+    path.join(inst, 'logs', 'latest-client.log')
+  ];
+}
+
+async function resolveConsoleLogPath(inst) {
+  for (const candidate of preferredConsoleLogPaths(inst)) {
+    if (await exists(candidate)) return candidate;
+  }
+  return preferredConsoleLogPaths(inst)[0];
 }
 
 async function readConsoleLogTail(logPath, maxBytes = 262144) {
@@ -998,14 +1020,18 @@ async function readConsoleLogTail(logPath, maxBytes = 262144) {
 
 async function getConsoleSnapshot(inst) {
   const client = getActiveClient(inst);
+  const logPath = await resolveConsoleLogPath(inst);
+  const logContent = await readConsoleLogTail(logPath);
   if (client) {
+    if (logContent && logContent !== client.buffer) {
+      client.buffer = trimConsoleBuffer(logContent);
+    }
     return {
-      content: client.buffer || '',
+      content: client.buffer || logContent,
       running: Boolean(client.running),
       message: client.running ? 'Client running' : 'Client stopped'
     };
   }
-  const logPath = path.join(inst, 'logs', 'latest-client.log');
   if (!(await exists(logPath))) return null;
   return {
     content: await readConsoleLogTail(logPath),
@@ -1480,6 +1506,28 @@ function replaceVars(text, vars) {
   return text.replace(/\$\{([^}]+)}/g, (_, key) => vars[key] ?? '');
 }
 
+async function buildLaunchEnvironment(inst) {
+  if (process.platform !== 'win32') {
+    return { ...process.env };
+  }
+  const appDataRoot = path.join(inst, 'launcher-env');
+  const roamingAppData = path.join(appDataRoot, 'AppData', 'Roaming');
+  const localAppData = path.join(appDataRoot, 'AppData', 'Local');
+  const tempDir = path.join(appDataRoot, 'Temp');
+  await Promise.all([
+    mkdir(roamingAppData),
+    mkdir(localAppData),
+    mkdir(tempDir)
+  ]);
+  return {
+    ...process.env,
+    APPDATA: roamingAppData,
+    LOCALAPPDATA: localAppData,
+    TEMP: tempDir,
+    TMP: tempDir
+  };
+}
+
 async function launchMinecraft() {
   const ready = await readiness();
   if (!ready.ready) throw new Error(`Launch blocked: ${ready.reason}`);
@@ -1524,21 +1572,23 @@ async function launchMinecraft() {
     ...tokenizeLaunchArgs(state.launchPreferences.extraJvmArgs || '')
   ], state.launchPreferences.maxMemoryMb);
   const gameArgs = [...collectArgs(versionRoot.arguments?.game, vars), ...collectArgs(fabricRoot.game, vars)];
-  const javaExe = resolveJavaExecutable({ preferConsoleOutput: true });
+  const javaExe = process.platform === 'win32'
+    ? resolveJavaExecutable()
+    : resolveJavaExecutable({ preferConsoleOutput: true });
   const mainClass = fabricRoot.mainClass || versionRoot.mainClass;
   await mkdir(path.join(inst, 'logs'));
   await mkdir(path.join(inst, 'metadata'));
-  const logPath = path.join(inst, 'logs', 'latest-client.log');
-  const log = fss.openSync(logPath, 'a');
+  const logPath = await resolveConsoleLogPath(inst);
+  const launchEnv = await buildLaunchEnvironment(inst);
   const child = spawn(javaExe, [...jvmArgs, mainClass, ...gameArgs], {
     cwd: inst,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: launchEnv,
     windowsHide: true,
     detached: false
   });
   const clientState = {
     child,
-    log,
     logPath,
     buffer: await readConsoleLogTail(logPath),
     running: true,
@@ -1549,21 +1599,21 @@ async function launchMinecraft() {
     sendConsoleEvent('console:replace', { content: clientState.buffer, running: true });
   }
   child.stdout?.on('data', chunk => {
-    const text = chunk.toString('utf8');
-    fss.writeSync(log, chunk);
-    appendConsoleOutput(inst, text);
+    appendConsoleOutput(inst, chunk.toString('utf8'));
   });
   child.stderr?.on('data', chunk => {
-    const text = chunk.toString('utf8');
-    fss.writeSync(log, chunk);
-    appendConsoleOutput(inst, text);
+    appendConsoleOutput(inst, chunk.toString('utf8'));
   });
-  await fs.writeFile(path.join(inst, 'metadata', 'active-client.pid'), String(child.pid));
+  await fs.writeFile(activeClientPidPath(inst), String(child.pid));
+  await fs.writeFile(activeClientMetaPath(inst), JSON.stringify({
+    pid: child.pid,
+    startedAt: new Date().toISOString()
+  }, null, 2));
   child.once('error', async error => {
     clientState.running = false;
     state.activeClients.delete(inst);
-    try { fss.closeSync(log); } catch {}
-    await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
+    await fs.rm(activeClientPidPath(inst), { force: true });
+    await fs.rm(activeClientMetaPath(inst), { force: true });
     if (state.consoleTargetInstance === inst) {
       sendConsoleEvent('console:status', { running: false, message: `Minecraft process start failed: ${error.message}` });
     }
@@ -1572,8 +1622,8 @@ async function launchMinecraft() {
   child.once('exit', async code => {
     clientState.running = false;
     state.activeClients.delete(inst);
-    try { fss.closeSync(log); } catch {}
-    await fs.rm(path.join(inst, 'metadata', 'active-client.pid'), { force: true });
+    await fs.rm(activeClientPidPath(inst), { force: true });
+    await fs.rm(activeClientMetaPath(inst), { force: true });
     if (state.consoleTargetInstance === inst) {
       sendConsoleEvent('console:status', { running: false, message: code !== 0 ? `Minecraft exited with code ${code}.` : 'Minecraft client closed.' });
     }
@@ -1587,7 +1637,7 @@ async function launchMinecraft() {
     }
     send('accounts', await publicState());
   });
-  return `Minecraft launch started. Output is being written to ${logPath}.`;
+  return `Minecraft launch started. Console log source: ${logPath}.`;
 }
 
 function resolveJavaExecutable(options = {}) {
@@ -1819,16 +1869,24 @@ function looksLikeLaunchFailure(line) {
 }
 
 async function isRunning(inst) {
-  const pidFile = path.join(inst, 'metadata', 'active-client.pid');
+  const activeClient = getActiveClient(inst);
+  if (activeClient?.child && activeClient.running && activeClient.child.exitCode == null) {
+    return true;
+  }
+  const pidFile = activeClientPidPath(inst);
   try {
     const pid = Number((await fs.readFile(pidFile, 'utf8')).trim());
     if (!pid) {
       await fs.rm(pidFile, { force: true });
+      await fs.rm(activeClientMetaPath(inst), { force: true });
       return false;
     }
     if (process.platform === 'win32') {
-      const running = isWindowsMinecraftProcess(pid, inst);
-      if (!running) await fs.rm(pidFile, { force: true });
+      const running = await isWindowsMinecraftProcess(pid, inst);
+      if (!running) {
+        await fs.rm(pidFile, { force: true });
+        await fs.rm(activeClientMetaPath(inst), { force: true });
+      }
       return running;
     }
     try {
@@ -1836,6 +1894,7 @@ async function isRunning(inst) {
       return true;
     } catch {
       await fs.rm(pidFile, { force: true });
+      await fs.rm(activeClientMetaPath(inst), { force: true });
       return false;
     }
   } catch {
@@ -1843,18 +1902,28 @@ async function isRunning(inst) {
   }
 }
 
-function isWindowsMinecraftProcess(pid, inst) {
+async function isWindowsMinecraftProcess(pid, inst) {
+  const meta = await readJson(activeClientMetaPath(inst), null);
   const query = spawnSync('powershell.exe', [
     '-NoProfile',
     '-Command',
-    `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object -ExpandProperty CommandLine`
+    `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object Name,CreationDate,CommandLine | ConvertTo-Json -Compress`
   ], { encoding: 'utf8', windowsHide: true });
-  const commandLine = (query.stdout || '').trim().toLowerCase();
-  if (!commandLine) return false;
-  const normalizedInstance = inst.toLowerCase();
-  return commandLine.includes('java')
-    && commandLine.includes('net.fabricmc.loader.impl.launch.knot.knotclient')
-    && commandLine.includes(normalizedInstance);
+  const raw = (query.stdout || '').trim();
+  if (!raw) return false;
+  let details = null;
+  try {
+    details = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  const processName = String(details?.Name || '').toLowerCase();
+  if (processName !== 'java.exe' && processName !== 'javaw.exe') return false;
+  if (!meta?.startedAt) return true;
+  const startedAt = Date.parse(meta.startedAt);
+  const creationDate = Date.parse(details?.CreationDate || '');
+  if (!Number.isFinite(startedAt) || !Number.isFinite(creationDate)) return true;
+  return Math.abs(creationDate - startedAt) < 10 * 60 * 1000;
 }
 
 async function openActiveProfileConsole() {
@@ -1864,11 +1933,12 @@ async function openActiveProfileConsole() {
     showInfoWindow('Console unavailable', 'The active profile does not currently have a launched Minecraft client.');
     return;
   }
-  const logPath = path.join(inst, 'logs', 'latest-client.log');
+  const logPath = await resolveConsoleLogPath(inst);
   if (!(await exists(logPath))) {
     showInfoWindow('Console unavailable', `Minecraft is running, but the console log was not found yet.\n\nExpected log:\n${logPath}`);
     return;
   }
+  const normalizedInstance = inst.toLowerCase();
   state.consoleTargetInstance = inst;
   const profileName = state.activeUsername || activeSession()?.username || 'Active Profile';
   const backgroundUrl = assetDataUrl('assets', 'background', 'layout_background_blank.png');
@@ -2146,6 +2216,10 @@ async function openActiveProfileConsole() {
       refreshOutput();
     });
     document.getElementById('close-button').addEventListener('click', () => window.close());
+
+    window.setInterval(() => {
+      refreshOutput();
+    }, 1500);
 
     initialize();
   </script>
@@ -3292,9 +3366,6 @@ function isFirstRunPrepareReason(reason) {
   ].includes(reason);
 }
 app.on('window-all-closed', () => {
-  for (const client of state.activeClients.values()) {
-    try { fss.closeSync(client.log); } catch {}
-  }
   state.activeClients.clear();
   state.login?.server?.close();
   if (process.platform !== 'darwin') app.quit();
