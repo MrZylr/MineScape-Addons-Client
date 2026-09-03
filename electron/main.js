@@ -135,6 +135,18 @@ async function download(url, target, headers = {}) {
   return target;
 }
 
+async function purgeGithubManagedDirectories(inst, tree = []) {
+  const managedRoots = [...new Set(
+    tree
+      .map(entry => String(entry?.path || '').split('/')[0])
+      .filter(name => name && name !== 'launcher_version' && name !== 'version')
+  )];
+  for (const dirName of managedRoots) {
+    const target = path.join(inst, dirName);
+    if (await exists(target)) await fs.rm(target, { recursive: true, force: true });
+  }
+}
+
 async function loadSessions() {
   const file = path.join(roots.metadata, 'account-sessions.json');
   const data = await readJson(file, { sessions: [], activeUsername: '' });
@@ -411,12 +423,13 @@ async function syncDefaults(inst) {
   const versionCheck = await checkDefaultResourceVersion(inst);
   const forceRemoteDownload = versionCheck.prepareRequired;
   status(`GitHub resources version: ${versionCheck.remoteVersion || 'missing'} | Local: ${versionCheck.localVersion || 'missing'} | Redownload: ${forceRemoteDownload}`);
-  if (forceRemoteDownload) {
-    status(`Default client resources changed from ${versionCheck.localVersion || 'none'} to ${versionCheck.remoteVersion}. Redownloading GitHub files...`);
-  }
   const tree = await fetchJson('https://api.github.com/repos/MrZylr/Minescape-Addons-Client-Resources/git/trees/main?recursive=1', {
     headers: { 'User-Agent': CONFIG.userAgent }
   });
+  if (forceRemoteDownload) {
+    status(`Default client resources changed from ${versionCheck.localVersion || 'none'} to ${versionCheck.remoteVersion}. Clearing matching local GitHub folders before redownload...`);
+    await purgeGithubManagedDirectories(inst, tree.tree || []);
+  }
   for (const entry of tree.tree || []) {
     if (!entry.path) continue;
     if (entry.path === 'launcher_version') continue;
